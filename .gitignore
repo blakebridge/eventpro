@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.claude/
+
+# Node (not used)
+node_modules/
+index.js
+package.json
+=8.0.0
+nul
+
+# Data files (too large for git)
+EVENTLEADS/irs_import.csv
+EVENTLEADS/irs_search.csv
+
+# Results (generated at runtime)
+results/

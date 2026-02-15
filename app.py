@@ -1,0 +1,2801 @@
+#!/usr/bin/env python3
+"""
+AUCTIONFINDER — Web Interface
+
+User-authenticated web UI with wallet-based billing for the Nonprofit
+Auction Event Finder. Uses Gemini + Google Search for research, Stripe
+for wallet top-ups, and SSE for real-time progress streaming.
+
+Usage:
+    set GEMINI3PRO_API_KEY=...
+    set STRIPE_SECRET_KEY=sk_test_...
+    set STRIPE_PUBLISHABLE_KEY=pk_test_...
+    python app.py
+"""
+
+import asyncio
+import csv
+import io
+import json
+import os
+import secrets
+import sys
+import time
+import threading
+import queue
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+from functools import wraps
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from flask import (
+    Flask, request, Response, jsonify, session,
+    redirect, url_for, send_file,
+)
+from google import genai
+from google.genai import types as gemini_types
+import stripe
+import openpyxl
+import psycopg2
+
+# ─── Import bot config & prompts ─────────────────────────────────────────────
+
+from bot import (
+    BATCH_SIZE, MAX_PARALLEL_BATCHES, MAX_NONPROFITS, GEMINI_MODEL,
+    DELAY_BETWEEN_BATCHES, ALLOWLISTED_PLATFORMS,
+    CSV_COLUMNS, SYSTEM_PROMPT, build_user_prompt, parse_input,
+    _error_result, extract_json, classify_lead_tier, _has_valid_url,
+    _quick_scan, _deep_research, _targeted_followup,
+    _quick_scan_to_full, _missing_billable_fields, _gemini_call,
+)
+
+from db import (
+    init_db, create_user, authenticate, get_user, get_user_full,
+    get_balance, add_funds, charge_research_fee, charge_lead_fee,
+    has_sufficient_balance, get_transactions, get_research_fee_cents,
+    update_password, get_spending_summary, get_job_breakdowns,
+    create_search_job, complete_search_job, fail_search_job,
+    get_user_jobs, cleanup_expired_jobs,
+    get_user_by_email, create_reset_token, validate_reset_token,
+    consume_reset_token,
+)
+import emails
+
+# ─── App Configuration ───────────────────────────────────────────────────────
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+
+RESULTS_DIR = os.environ.get("RESULTS_DIR", "results")
+DB_CONN_STRING = os.environ.get(
+    "IRS_DB_CONNECTION",
+    "postgresql://localhost/irs"
+)
+
+# Stripe config
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
+DOMAIN = os.environ.get("APP_DOMAIN", "http://localhost:5000")
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# Store active jobs: job_id -> { status, results, progress_queue, ... }
+jobs: Dict[str, Dict[str, Any]] = {}
+
+
+def get_irs_db():
+    """Get an IRS PostgreSQL database connection."""
+    return psycopg2.connect(DB_CONN_STRING)
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("user_id"):
+            if request.headers.get("Accept", "").startswith("text/event-stream"):
+                return Response("Unauthorized", status=401)
+            return redirect(url_for("login_page"))
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _current_user():
+    """Get current user dict from session."""
+    uid = session.get("user_id")
+    if uid:
+        return get_user(uid)
+    return None
+
+
+def _is_admin():
+    """Check if current user is admin."""
+    user = _current_user()
+    return user and user.get("is_admin", False)
+
+
+# ─── Research Worker (runs in background thread with its own event loop) ─────
+
+async def _research_nonprofit_web(
+    client: genai.Client,
+    nonprofit: str,
+    semaphore: asyncio.Semaphore,
+    index: int,
+    total: int,
+    progress_q: queue.Queue,
+    user_id: Optional[int] = None,
+    job_id: str = "",
+    is_admin: bool = False,
+    is_trial: bool = False,
+) -> Dict[str, Any]:
+    """Research a single nonprofit using 3-phase early-stop strategy.
+    Pushes progress events to the queue. Charges fees for non-admin users.
+    Trial users are only charged for billable results (no research fee on dead leads).
+    """
+    async with semaphore:
+        progress_q.put({"type": "processing", "index": index, "total": total, "nonprofit": nonprofit})
+        api_calls = 0
+        text = ""
+
+        try:
+            # ── Phase 1: Quick Scan ──
+            api_calls += 1
+            scan = await _quick_scan(client, nonprofit)
+
+            # Quick negative
+            if not scan.get("has_event") and scan.get("confidence", 0) >= 0.80:
+                result = _quick_scan_to_full(scan, nonprofit)
+                result["_api_calls"] = api_calls
+                result["_phase"] = "quick_scan"
+                result["_processed_at"] = datetime.now(timezone.utc).isoformat()
+                result["_source"] = "gemini"
+
+                # Charge research fee (trial users: free on dead leads)
+                if user_id and not is_admin and not is_trial:
+                    fee = get_research_fee_cents(total)
+                    charge_research_fee(user_id, 1, job_id, fee)
+                    progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+
+                progress_q.put({
+                    "type": "result", "index": index, "total": total,
+                    "nonprofit": nonprofit, "status": "not_found",
+                    "event_title": "", "confidence": 0, "tier": "not_billable", "tier_price": 0,
+                })
+                return result
+
+            # Quick positive — all billable fields INCLUDING event_url
+            if scan.get("has_event") and scan.get("confidence", 0) >= 0.85:
+                full_from_scan = _quick_scan_to_full(scan, nonprofit)
+                tier, price = classify_lead_tier(full_from_scan)
+                if tier == "full" and _has_valid_url(full_from_scan):
+                    full_from_scan["_api_calls"] = api_calls
+                    full_from_scan["_phase"] = "quick_scan"
+                    full_from_scan["_processed_at"] = datetime.now(timezone.utc).isoformat()
+                    full_from_scan["_source"] = "gemini"
+
+                    if user_id and not is_admin:
+                        fee = get_research_fee_cents(total)
+                        charge_research_fee(user_id, 1, job_id, fee)
+                        charge_lead_fee(user_id, tier, price, job_id, nonprofit)
+                        progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+
+                    progress_q.put({
+                        "type": "result", "index": index, "total": total,
+                        "nonprofit": nonprofit, "status": "found",
+                        "event_title": scan.get("event_title", ""),
+                        "confidence": scan.get("confidence", 0),
+                        "tier": tier, "tier_price": price,
+                    })
+                    return full_from_scan
+
+            # ── Phase 2: Deep Research ──
+            api_calls += 1
+            result = await _deep_research(client, nonprofit)
+            result["_processed_at"] = datetime.now(timezone.utc).isoformat()
+            result["_source"] = "gemini"
+
+            status = result.get("status", "uncertain")
+
+            if status == "not_found":
+                result["_api_calls"] = api_calls
+                result["_phase"] = "deep_research"
+
+                if user_id and not is_admin and not is_trial:
+                    fee = get_research_fee_cents(total)
+                    charge_research_fee(user_id, 1, job_id, fee)
+                    progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+
+                progress_q.put({
+                    "type": "result", "index": index, "total": total,
+                    "nonprofit": nonprofit, "status": "not_found",
+                    "event_title": "", "confidence": 0, "tier": "not_billable", "tier_price": 0,
+                })
+                return result
+
+            # Check tier
+            tier, price = classify_lead_tier(result)
+            missing = _missing_billable_fields(result)
+
+            # ── Phase 3: Targeted Follow-up ──
+            if len(missing) == 1 and result.get("event_title", "").strip():
+                api_calls += 1
+                field = missing[0]
+                try:
+                    followup = await _targeted_followup(
+                        client, nonprofit,
+                        result.get("event_title", ""),
+                        result.get("event_date", ""),
+                        field,
+                    )
+                    value = followup.get(field, "").strip()
+                    if value:
+                        result[field] = value
+                        if followup.get("source_url"):
+                            result["contact_source_url"] = followup["source_url"]
+                except Exception:
+                    pass
+
+            # Final classification
+            tier, price = classify_lead_tier(result)
+            title = result.get("event_title", "")
+            status = result.get("status", "uncertain")
+            result["_api_calls"] = api_calls
+            result["_phase"] = f"phase_{api_calls}"
+
+            # Charge fees (trial users: only charged for billable results)
+            if user_id and not is_admin:
+                if is_trial:
+                    if price > 0:
+                        fee = get_research_fee_cents(total)
+                        charge_research_fee(user_id, 1, job_id, fee)
+                        charge_lead_fee(user_id, tier, price, job_id, nonprofit)
+                        progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                else:
+                    fee = get_research_fee_cents(total)
+                    charge_research_fee(user_id, 1, job_id, fee)
+                    if price > 0:
+                        charge_lead_fee(user_id, tier, price, job_id, nonprofit)
+                    progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+
+            progress_q.put({
+                "type": "result", "index": index, "total": total,
+                "nonprofit": nonprofit, "status": status,
+                "event_title": title if is_admin else "",
+                "confidence": result.get("confidence_score", 0),
+                "tier": tier, "tier_price": price,
+            })
+            return result
+
+        except json.JSONDecodeError:
+            progress_q.put({
+                "type": "result", "index": index, "total": total,
+                "nonprofit": nonprofit, "status": "error",
+                "event_title": "JSON parse error", "confidence": 0,
+                "tier": "not_billable", "tier_price": 0,
+            })
+            # Charge research fee on error (trial users: free on errors)
+            if user_id and not is_admin and not is_trial:
+                fee = get_research_fee_cents(total)
+                charge_research_fee(user_id, 1, job_id, fee)
+                progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+            return _error_result(nonprofit, "Failed to parse response as JSON", text[:500] if text else "")
+
+        except Exception as e:
+            progress_q.put({
+                "type": "result", "index": index, "total": total,
+                "nonprofit": nonprofit, "status": "error",
+                "event_title": str(e)[:80], "confidence": 0,
+                "tier": "not_billable", "tier_price": 0,
+            })
+            if user_id and not is_admin and not is_trial:
+                fee = get_research_fee_cents(total)
+                charge_research_fee(user_id, 1, job_id, fee)
+                progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+            return _error_result(nonprofit, str(e))
+
+
+async def _run_job(
+    nonprofits: List[str], job_id: str, progress_q: queue.Queue,
+    user_id: Optional[int] = None, is_admin: bool = False, is_trial: bool = False,
+):
+    """Run the full research pipeline for a web job."""
+    if len(nonprofits) > MAX_NONPROFITS:
+        nonprofits = nonprofits[:MAX_NONPROFITS]
+
+    client = genai.Client(api_key=os.environ.get("GEMINI3PRO_API_KEY"))
+    batches = [nonprofits[i:i + BATCH_SIZE] for i in range(0, len(nonprofits), BATCH_SIZE)]
+    total_batches = len(batches)
+    semaphore = asyncio.Semaphore(BATCH_SIZE * MAX_PARALLEL_BATCHES)
+
+    progress_q.put({
+        "type": "started",
+        "total": len(nonprofits),
+        "batches": total_batches,
+    })
+
+    all_results: List[Dict[str, Any]] = []
+    billing_summary = {"research_fees": 0, "lead_fees": {}, "total_charged": 0}
+    start = time.time()
+
+    for i in range(0, total_batches, MAX_PARALLEL_BATCHES):
+        group = batches[i:i + MAX_PARALLEL_BATCHES]
+        global_offset = sum(len(b) for b in batches[:i])
+
+        batch_tasks = []
+        for j, batch in enumerate(group):
+            offset = global_offset + sum(len(g) for g in group[:j])
+            for k, np_name in enumerate(batch):
+                batch_tasks.append(
+                    _research_nonprofit_web(
+                        client, np_name, semaphore, offset + k + 1,
+                        len(nonprofits), progress_q,
+                        user_id=user_id, job_id=job_id, is_admin=is_admin, is_trial=is_trial,
+                    )
+                )
+
+        results = await asyncio.gather(*batch_tasks)
+        all_results.extend(results)
+
+        completed = min(i + MAX_PARALLEL_BATCHES, total_batches)
+        progress_q.put({
+            "type": "batch_done",
+            "completed_batches": completed,
+            "total_batches": total_batches,
+            "processed": len(all_results),
+            "total": len(nonprofits),
+        })
+
+        if completed < total_batches:
+            await asyncio.sleep(DELAY_BETWEEN_BATCHES)
+
+    elapsed = time.time() - start
+
+    # Compute billing summary
+    fee_cents = get_research_fee_cents(len(nonprofits))
+    billing_summary["research_fees"] = len(nonprofits) * fee_cents
+    tier_counts = {}
+    for r in all_results:
+        tier, price = classify_lead_tier(r)
+        if price > 0:
+            if tier not in tier_counts:
+                tier_counts[tier] = {"count": 0, "price_each": price, "total": 0}
+            tier_counts[tier]["count"] += 1
+            tier_counts[tier]["total"] += price
+            billing_summary["lead_fees"] = tier_counts
+    billing_summary["total_charged"] = (
+        billing_summary["research_fees"]
+        + sum(t["total"] for t in tier_counts.values())
+    )
+
+    # Determine which results to save (billable only for non-admin)
+    if is_admin:
+        save_results = all_results
+    else:
+        save_results = [r for r in all_results if classify_lead_tier(r)[1] > 0]
+
+    # Save results
+    csv_file = os.path.join(RESULTS_DIR, f"{job_id}.csv")
+    json_file = os.path.join(RESULTS_DIR, f"{job_id}.json")
+
+    with open(csv_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore", quoting=csv.QUOTE_ALL)
+        writer.writeheader()
+        for r in save_results:
+            row = {col: r.get(col, "") for col in CSV_COLUMNS}
+            writer.writerow(row)
+
+    output = {
+        "meta": {
+            "total_nonprofits": len(all_results),
+            "processing_time_seconds": round(elapsed, 2),
+            "model": GEMINI_MODEL,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+        "summary": {
+            "found": sum(1 for r in all_results if r.get("status") == "found"),
+            "external_found": sum(1 for r in all_results if r.get("status") == "external_found"),
+            "not_found": sum(1 for r in all_results if r.get("status") == "not_found"),
+            "uncertain": sum(1 for r in all_results if r.get("status") == "uncertain"),
+        },
+        "billing": billing_summary if not is_admin else None,
+        "results": save_results,
+    }
+    with open(json_file, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+
+    xlsx_file = os.path.join(RESULTS_DIR, f"{job_id}.xlsx")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Auction Results"
+    ws.append(CSV_COLUMNS)
+    for r in save_results:
+        ws.append([r.get(col, "") for col in CSV_COLUMNS])
+    for col_cells in ws.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col_cells), default=10)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 50)
+    wb.save(xlsx_file)
+
+    # Final event
+    complete_event = {
+        "type": "complete",
+        "job_id": job_id,
+        "elapsed": round(elapsed, 1),
+        "summary": output["summary"],
+        "csv_file": f"{job_id}.csv",
+        "json_file": f"{job_id}.json",
+        "xlsx_file": f"{job_id}.xlsx",
+    }
+    if not is_admin:
+        complete_event["billing"] = billing_summary
+        complete_event["balance"] = get_balance(user_id) if user_id else 0
+        complete_event["billable_count"] = len(save_results)
+    progress_q.put(complete_event)
+    progress_q.put(None)  # sentinel
+
+    jobs[job_id]["status"] = "complete"
+    jobs[job_id]["results"] = output
+
+    # Persist job completion to SQLite
+    found_count = output["summary"].get("found", 0) + output["summary"].get("external_found", 0)
+    billable_count = len(save_results) if not is_admin else found_count
+    total_cost_cents = billing_summary["total_charged"] if not is_admin else 0
+    complete_search_job(
+        job_id,
+        found_count=found_count,
+        billable_count=billable_count,
+        total_cost_cents=total_cost_cents,
+        results_summary=json.dumps(output["summary"]),
+    )
+
+    # Send job completion email
+    if user_id and not is_admin:
+        user = get_user(user_id)
+        if user:
+            emails.send_job_complete(
+                user["email"], job_id, len(nonprofits),
+                found_count, billable_count, total_cost_cents,
+            )
+
+
+def _job_worker(
+    nonprofits: List[str], job_id: str, progress_q: queue.Queue,
+    user_id: Optional[int] = None, is_admin: bool = False, is_trial: bool = False,
+):
+    """Thread target that runs the async job."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(
+            _run_job(nonprofits, job_id, progress_q, user_id=user_id, is_admin=is_admin, is_trial=is_trial)
+        )
+    except Exception as e:
+        progress_q.put({"type": "error", "message": str(e)})
+        progress_q.put(None)
+        jobs[job_id]["status"] = "error"
+        fail_search_job(job_id, str(e))
+    finally:
+        loop.close()
+
+
+# ─── Routes: Auth ────────────────────────────────────────────────────────────
+
+@app.route("/register", methods=["GET"])
+def register_page():
+    return REGISTER_HTML
+
+@app.route("/register", methods=["POST"])
+def register_submit():
+    from db import is_work_email
+
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+    confirm = request.form.get("confirm", "")
+    phone = request.form.get("phone", "").strip()
+    company = request.form.get("company", "").strip()
+    promo_code = request.form.get("promo_code", "").strip()
+
+    if not email or not password:
+        return REGISTER_HTML.replace("<!-- error -->", '<p class="error">All fields are required</p>')
+    if not is_work_email(email):
+        return REGISTER_HTML.replace("<!-- error -->", '<p class="error">Please use a work email address (no Gmail, Yahoo, etc.)</p>')
+    if not company:
+        return REGISTER_HTML.replace("<!-- error -->", '<p class="error">Company name is required</p>')
+    if not phone:
+        return REGISTER_HTML.replace("<!-- error -->", '<p class="error">Phone number is required</p>')
+    if password != confirm:
+        return REGISTER_HTML.replace("<!-- error -->", '<p class="error">Passwords do not match</p>')
+    if len(password) < 6:
+        return REGISTER_HTML.replace("<!-- error -->", '<p class="error">Password must be at least 6 characters</p>')
+    try:
+        user_id = create_user(email, password, phone=phone, company=company, promo_code=promo_code)
+        session["user_id"] = user_id
+        session["is_admin"] = False
+        is_trial = promo_code.strip().upper() == "26AUCTION26"
+        session["is_trial"] = is_trial
+        emails.send_welcome(email, is_trial=is_trial)
+        return redirect(url_for("wallet_page"))
+    except Exception:
+        return REGISTER_HTML.replace("<!-- error -->", '<p class="error">Email already registered</p>')
+
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    return LOGIN_HTML
+
+
+@app.route("/login", methods=["POST"])
+def login_submit():
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+    user = authenticate(email, password)
+    if user:
+        session["user_id"] = user["id"]
+        session["is_admin"] = user["is_admin"]
+        session["is_trial"] = user.get("is_trial", False)
+        return redirect(url_for("database_page"))
+    return LOGIN_HTML.replace("<!-- error -->", '<p class="error">Invalid email or password</p>')
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login_page"))
+
+
+# ─── Routes: Password Reset ──────────────────────────────────────────────────
+
+@app.route("/forgot-password", methods=["GET"])
+def forgot_password_page():
+    return FORGOT_PASSWORD_HTML
+
+
+@app.route("/forgot-password", methods=["POST"])
+def forgot_password_submit():
+    email = request.form.get("email", "").strip().lower()
+    if email:
+        user = get_user_by_email(email)
+        if user:
+            token = create_reset_token(user["id"])
+            reset_url = f"{DOMAIN}/reset-password?token={token}"
+            emails.send_password_reset(email, reset_url)
+    # Always show same message to prevent email enumeration
+    return FORGOT_PASSWORD_HTML.replace(
+        "<!-- message -->",
+        '<p class="success">If an account exists with that email, we sent a password reset link. Check your inbox.</p>'
+    )
+
+
+@app.route("/reset-password", methods=["GET"])
+def reset_password_page():
+    token = request.args.get("token", "")
+    user_id = validate_reset_token(token)
+    if not user_id:
+        return FORGOT_PASSWORD_HTML.replace(
+            "<!-- message -->",
+            '<p class="error">This reset link is invalid or has expired. Please request a new one.</p>'
+        )
+    return RESET_PASSWORD_HTML.replace("{{TOKEN}}", token)
+
+
+@app.route("/reset-password", methods=["POST"])
+def reset_password_submit():
+    token = request.form.get("token", "")
+    password = request.form.get("password", "")
+    confirm = request.form.get("confirm", "")
+
+    if len(password) < 6:
+        return RESET_PASSWORD_HTML.replace("{{TOKEN}}", token).replace(
+            "<!-- error -->", '<p class="error">Password must be at least 6 characters</p>'
+        )
+    if password != confirm:
+        return RESET_PASSWORD_HTML.replace("{{TOKEN}}", token).replace(
+            "<!-- error -->", '<p class="error">Passwords do not match</p>'
+        )
+
+    user_id = validate_reset_token(token)
+    if not user_id:
+        return FORGOT_PASSWORD_HTML.replace(
+            "<!-- message -->",
+            '<p class="error">This reset link is invalid or has expired. Please request a new one.</p>'
+        )
+
+    update_password(user_id, password)
+    consume_reset_token(token)
+    return LOGIN_HTML.replace(
+        "<!-- error -->",
+        '<p class="success">Password reset successfully. Please log in with your new password.</p>'
+    )
+
+
+# ─── Routes: Wallet ──────────────────────────────────────────────────────────
+
+@app.route("/wallet")
+@login_required
+def wallet_page():
+    user_id = session["user_id"]
+    balance = get_balance(user_id)
+    txns = get_transactions(user_id, limit=50)
+    user = _current_user()
+
+    txn_rows = ""
+    for t in txns:
+        amt = t["amount_cents"]
+        amt_str = f"+${amt/100:.2f}" if amt > 0 else f"-${abs(amt)/100:.2f}"
+        color = "#4ade80" if amt > 0 else "#f87171"
+        txn_rows += f'<tr><td>{t["created_at"]}</td><td>{t["type"]}</td><td style="color:{color}">{amt_str}</td><td>{t["description"] or ""}</td></tr>'
+
+    html = WALLET_HTML.replace("{{BALANCE}}", f"${balance/100:.2f}")
+    html = html.replace("{{STRIPE_PK}}", STRIPE_PUBLISHABLE_KEY)
+    html = html.replace("{{TXN_ROWS}}", txn_rows)
+    html = html.replace("{{EMAIL}}", user["email"] if user else "")
+    return html
+
+
+@app.route("/api/wallet/topup", methods=["POST"])
+@login_required
+def wallet_topup():
+    data = request.get_json()
+    amount_dollars = data.get("amount", 0)
+
+    try:
+        amount_dollars = float(amount_dollars)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid amount"}), 400
+
+    if amount_dollars < 250 or amount_dollars > 9999:
+        return jsonify({"error": "Amount must be between $250 and $9,999"}), 400
+
+    amount_cents = int(amount_dollars * 100)
+    user_id = session["user_id"]
+
+    try:
+        checkout_session = stripe.checkout.Session.create(
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": amount_cents,
+                    "product_data": {"name": "AUCTIONFINDER Wallet Top-Up"},
+                },
+                "quantity": 1,
+            }],
+            mode="payment",
+            success_url=f"{DOMAIN}/wallet/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{DOMAIN}/wallet",
+            metadata={"user_id": str(user_id)},
+        )
+        return jsonify({"url": checkout_session.url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/wallet/success")
+@login_required
+def wallet_success():
+    session_id = request.args.get("session_id")
+    if not session_id:
+        return redirect(url_for("wallet_page"))
+
+    try:
+        checkout_session = stripe.checkout.Session.retrieve(session_id)
+        if checkout_session.payment_status == "paid":
+            user_id = int(checkout_session.metadata.get("user_id", 0))
+            if user_id == session["user_id"]:
+                amount_cents = checkout_session.amount_total
+                add_funds(user_id, amount_cents, f"Stripe payment: {session_id[:20]}")
+                user = get_user(user_id)
+                if user:
+                    new_balance = get_balance(user_id)
+                    emails.send_funds_receipt(user["email"], amount_cents, new_balance)
+    except Exception:
+        pass
+
+    return redirect(url_for("wallet_page"))
+
+
+# ─── Routes: Profile ─────────────────────────────────────────────────────────
+
+@app.route("/profile")
+@login_required
+def profile_page():
+    user = get_user_full(session["user_id"])
+    balance = get_balance(session["user_id"])
+    summary = get_spending_summary(session["user_id"])
+
+    html = PROFILE_HTML.replace("{{EMAIL}}", user["email"] if user else "")
+    html = html.replace("{{CREATED_AT}}", user["created_at"] or "Unknown" if user else "Unknown")
+    html = html.replace("{{ACCOUNT_TYPE}}", "Administrator" if user and user["is_admin"] else "Standard")
+    html = html.replace("{{BALANCE}}", f"${balance/100:.2f}")
+    html = html.replace("{{TOTAL_SPENT}}", f"${summary['total_spent']/100:.2f}")
+    html = html.replace("{{TOTAL_TOPUPS}}", f"${summary['total_topups']/100:.2f}")
+    html = html.replace("{{JOB_COUNT}}", str(summary["job_count"]))
+    return html
+
+
+@app.route("/profile/password", methods=["POST"])
+@login_required
+def change_password():
+    current = request.form.get("current_password", "")
+    new_pw = request.form.get("new_password", "")
+    confirm = request.form.get("confirm_password", "")
+
+    user = get_user(session["user_id"])
+    if not user:
+        return redirect(url_for("profile_page"))
+
+    # Verify current password
+    auth = authenticate(user["email"], current)
+    if not auth:
+        return redirect(url_for("profile_page") + "?error=current")
+    if len(new_pw) < 6:
+        return redirect(url_for("profile_page") + "?error=length")
+    if new_pw != confirm:
+        return redirect(url_for("profile_page") + "?error=match")
+
+    update_password(session["user_id"], new_pw)
+    return redirect(url_for("profile_page") + "?success=1")
+
+
+# ─── Routes: Billing ─────────────────────────────────────────────────────────
+
+@app.route("/billing")
+@login_required
+def billing_page():
+    user_id = session["user_id"]
+    user = _current_user()
+    balance = get_balance(user_id)
+    summary = get_spending_summary(user_id)
+    persistent_jobs = get_user_jobs(user_id, limit=50)
+    txns = get_transactions(user_id, limit=100)
+
+    job_rows = ""
+    for j in persistent_jobs:
+        cost = j["total_cost_cents"] or 0
+        status_color = "#4ade80" if j["status"] == "complete" else "#f87171" if j["status"] == "error" else "#eab308"
+        dl_links = ""
+        if j["status"] == "complete":
+            jid = j["job_id"]
+            dl_links = (
+                f'<a href="/api/download/{jid}/csv" style="color:#eab308;text-decoration:none;margin-right:6px;">CSV</a>'
+                f'<a href="/api/download/{jid}/json" style="color:#7c3aed;text-decoration:none;margin-right:6px;">JSON</a>'
+                f'<a href="/api/download/{jid}/xlsx" style="color:#60a5fa;text-decoration:none;">XLSX</a>'
+            )
+        job_rows += (
+            f'<tr><td>{j["created_at"] or ""}</td>'
+            f'<td style="color:{status_color}">{j["status"]}</td>'
+            f'<td>{j["nonprofit_count"]}</td>'
+            f'<td>{j["found_count"] or 0}</td>'
+            f'<td>{j["billable_count"] or 0}</td>'
+            f'<td style="font-weight:700;color:#eab308;">${cost/100:.2f}</td>'
+            f'<td>{dl_links}</td></tr>'
+        )
+
+    txn_rows = ""
+    for t in txns:
+        amt = t["amount_cents"]
+        amt_str = f"+${amt/100:.2f}" if amt > 0 else f"-${abs(amt)/100:.2f}"
+        color = "#4ade80" if amt > 0 else "#f87171"
+        txn_rows += (
+            f'<tr><td>{t["created_at"]}</td><td>{t["type"]}</td>'
+            f'<td style="color:{color}">{amt_str}</td>'
+            f'<td>{t["description"] or ""}</td>'
+            f'<td style="font-family:monospace;font-size:11px;">{t["job_id"] or ""}</td></tr>'
+        )
+
+    html = BILLING_HTML.replace("{{EMAIL}}", user["email"] if user else "")
+    html = html.replace("{{BALANCE}}", f"${balance/100:.2f}")
+    html = html.replace("{{TOTAL_SPENT}}", f"${summary['total_spent']/100:.2f}")
+    html = html.replace("{{RESEARCH_FEES}}", f"${summary['research_fees']/100:.2f}")
+    html = html.replace("{{LEAD_FEES}}", f"${summary['lead_fees']/100:.2f}")
+    html = html.replace("{{TOTAL_TOPUPS}}", f"${summary['total_topups']/100:.2f}")
+    html = html.replace("{{JOB_COUNT}}", str(summary["job_count"]))
+    html = html.replace("{{JOB_ROWS}}", job_rows)
+    html = html.replace("{{TXN_ROWS}}", txn_rows)
+    return html
+
+
+# ─── Routes: Results ─────────────────────────────────────────────────────────
+
+@app.route("/results")
+@login_required
+def results_page():
+    user_id = session["user_id"]
+    user = _current_user()
+    past_jobs = get_user_jobs(user_id, limit=50)
+
+    job_cards = ""
+    for j in past_jobs:
+        jid = j["job_id"]
+        cost = j["total_cost_cents"] or 0
+        status = j["status"]
+        status_color = "#4ade80" if status == "complete" else "#f87171" if status == "error" else "#eab308"
+        status_label = status.upper()
+
+        dl_links = ""
+        if status == "complete":
+            dl_links = (
+                f'<div class="dl-btns">'
+                f'<a href="/api/download/{jid}/csv" class="dl-btn csv">CSV</a>'
+                f'<a href="/api/download/{jid}/json" class="dl-btn json">JSON</a>'
+                f'<a href="/api/download/{jid}/xlsx" class="dl-btn xlsx">XLSX</a>'
+                f'</div>'
+            )
+
+        job_cards += (
+            f'<div class="job-card">'
+            f'<div class="job-header">'
+            f'<span class="job-date">{j["created_at"] or ""}</span>'
+            f'<span class="job-status" style="color:{status_color}">{status_label}</span>'
+            f'</div>'
+            f'<div class="job-stats">'
+            f'<div class="js"><span class="jn">{j["nonprofit_count"]}</span><span class="jl">Searched</span></div>'
+            f'<div class="js"><span class="jn" style="color:#4ade80">{j["found_count"] or 0}</span><span class="jl">Found</span></div>'
+            f'<div class="js"><span class="jn" style="color:#eab308">{j["billable_count"] or 0}</span><span class="jl">Billable</span></div>'
+            f'<div class="js"><span class="jn" style="color:#f87171">${cost/100:.2f}</span><span class="jl">Cost</span></div>'
+            f'</div>'
+            f'{dl_links}'
+            f'</div>'
+        )
+
+    if not job_cards:
+        job_cards = '<div class="empty-state"><p>No search results yet.</p><p>Run your first search from <a href="/search" style="color:#eab308">Auction Search</a>.</p></div>'
+
+    html = RESULTS_HTML.replace("{{EMAIL}}", user["email"] if user else "")
+    html = html.replace("{{JOB_CARDS}}", job_cards)
+    return html
+
+
+# ─── Routes: Search ──────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    # Show landing page for non-authenticated users
+    if not session.get("user_id"):
+        return LANDING_HTML
+    user = _current_user()
+    if not user:
+        session.clear()
+        return LANDING_HTML
+    is_admin = user.get("is_admin", False)
+    balance = get_balance(session["user_id"]) if not is_admin else 0
+
+    html = INDEX_HTML.replace("{{IS_ADMIN}}", "true" if is_admin else "false")
+    html = html.replace("{{BALANCE_CENTS}}", str(balance))
+    html = html.replace("{{EMAIL}}", user["email"] if user else "")
+    return html
+
+
+@app.route("/api/search", methods=["POST"])
+@login_required
+def start_search():
+    data = request.get_json()
+    raw_input = data.get("nonprofits", "")
+    nonprofits = parse_input(raw_input)
+
+    if not nonprofits:
+        return jsonify({"error": "No nonprofits provided"}), 400
+
+    if len(nonprofits) > MAX_NONPROFITS:
+        return jsonify({"error": f"Maximum {MAX_NONPROFITS} nonprofits allowed"}), 400
+
+    user_id = session["user_id"]
+    is_admin = session.get("is_admin", False)
+    is_trial = session.get("is_trial", False)
+
+    # Pre-search balance check for non-admin
+    if not is_admin:
+        balance = get_balance(user_id)
+        if is_trial:
+            # Trial users only pay for real results — just need positive balance
+            if balance <= 0:
+                return jsonify({
+                    "error": "Trial balance exhausted. Top up your wallet to continue searching."
+                }), 402
+        else:
+            fee_per = get_research_fee_cents(len(nonprofits))
+            estimated_cost = len(nonprofits) * fee_per
+            if balance < estimated_cost:
+                need = estimated_cost / 100
+                have = balance / 100
+                return jsonify({
+                    "error": f"Insufficient balance. Need ${need:.2f} research fee, have ${have:.2f}. Top up your wallet first."
+                }), 402
+
+    job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
+    progress_q: queue.Queue = queue.Queue()
+
+    jobs[job_id] = {
+        "status": "running",
+        "nonprofits": nonprofits,
+        "progress_queue": progress_q,
+        "results": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "user_id": user_id,
+    }
+
+    # Persist job to SQLite
+    create_search_job(user_id, job_id, len(nonprofits))
+
+    thread = threading.Thread(
+        target=_job_worker,
+        args=(nonprofits, job_id, progress_q),
+        kwargs={"user_id": user_id, "is_admin": is_admin, "is_trial": is_trial},
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({
+        "job_id": job_id,
+        "total": len(nonprofits),
+        "research_fee_each": get_research_fee_cents(len(nonprofits)),
+    })
+
+
+@app.route("/api/progress/<job_id>")
+@login_required
+def stream_progress(job_id):
+    if job_id not in jobs:
+        return Response("Job not found", status=404)
+
+    progress_q = jobs[job_id]["progress_queue"]
+
+    def generate():
+        while True:
+            try:
+                event = progress_q.get(timeout=120)
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+            except queue.Empty:
+                yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+
+    return Response(generate(), mimetype="text/event-stream")
+
+
+@app.route("/api/download/<job_id>/<fmt>")
+@login_required
+def download_result(job_id, fmt):
+    if fmt not in ("csv", "json", "xlsx"):
+        return Response("Invalid format", status=400)
+
+    filepath = os.path.join(RESULTS_DIR, f"{job_id}.{fmt}")
+    if not os.path.exists(filepath):
+        return Response("File not found", status=404)
+
+    return send_file(
+        filepath,
+        as_attachment=True,
+        download_name=f"auction_results_{job_id}.{fmt}",
+    )
+
+
+@app.route("/api/results/<job_id>")
+@login_required
+def view_results(job_id):
+    if job_id not in jobs or jobs[job_id]["status"] != "complete":
+        return jsonify({"error": "Job not found or not complete"}), 404
+    return jsonify(jobs[job_id]["results"])
+
+
+# ─── IRS Database Search ─────────────────────────────────────────────────────
+
+@app.route("/database")
+@login_required
+def database_page():
+    user = _current_user()
+    html = DATABASE_HTML.replace("{{EMAIL}}", user["email"] if user else "")
+    html = html.replace("{{IS_ADMIN}}", "true" if user and user.get("is_admin") else "false")
+    return html
+
+
+REGIONS = {
+    "northeast": ["CT", "DE", "DC", "ME", "MD", "MA", "NH", "NJ", "NY", "PA", "RI", "VT"],
+    "southeast": ["AL", "AR", "FL", "GA", "KY", "LA", "MS", "NC", "SC", "TN", "VA", "WV"],
+    "midwest": ["IL", "IN", "IA", "KS", "MI", "MN", "MO", "NE", "ND", "OH", "SD", "WI"],
+    "southwest": ["AZ", "NM", "OK", "TX"],
+    "west": ["AK", "CA", "CO", "HI", "ID", "MT", "NV", "OR", "UT", "WA", "WY"],
+}
+
+AMOUNT_RANGES = {
+    "1-100k": (1, 100000),
+    "100k-500k": (100000, 500000),
+    "500k-1m": (500000, 1000000),
+    "1m-2m": (1000000, 2000000),
+    "2m-5m": (2000000, 5000000),
+    "5m+": (5000000, None),
+}
+
+
+def _add_amount_filter(conditions, params, field, range_key):
+    """Add a min/max amount filter from a range key."""
+    if not range_key or range_key not in AMOUNT_RANGES:
+        return
+    lo, hi = AMOUNT_RANGES[range_key]
+    conditions.append(f"{field} >= %s")
+    params.append(lo)
+    if hi is not None:
+        conditions.append(f"{field} <= %s")
+        params.append(hi)
+
+
+@app.route("/api/irs/search", methods=["POST"])
+@login_required
+def irs_search():
+    data = request.get_json()
+    limit = min(int(data.get("limit", 100)), 10000)
+
+    conditions = []
+    params = []
+
+    name = data.get("name", "").strip()
+    if name:
+        conditions.append("OrganizationName LIKE %s")
+        params.append(f"{name}%")
+
+    city = data.get("city", "").strip()
+    if city:
+        conditions.append("PhysicalCity LIKE %s")
+        params.append(f"{city}%")
+
+    state = data.get("state", "").strip()
+    region = data.get("region", "").strip()
+    if state:
+        conditions.append("PhysicalState = %s")
+        params.append(state.upper())
+    elif region:
+        conditions.append("Region5 = %s")
+        params.append(region.capitalize())
+
+    event_keyword = data.get("event_keyword", "").strip()
+    if event_keyword:
+        conditions.append("(Event1Name LIKE %s OR Event2Name LIKE %s)")
+        params.append(f"%{event_keyword}%")
+        params.append(f"%{event_keyword}%")
+
+    mission_keyword = data.get("mission_keyword", "").strip()
+    if mission_keyword:
+        conditions.append("MissionDescriptionShort LIKE %s")
+        params.append(f"%{mission_keyword}%")
+
+    primary_event_type = data.get("primary_event_type", "").strip()
+    if primary_event_type:
+        conditions.append("PrimaryEventType = %s")
+        params.append(primary_event_type.upper())
+
+    prospect_tier = data.get("prospect_tier", "").strip()
+    if prospect_tier:
+        conditions.append("ProspectTier = %s")
+        params.append(prospect_tier)
+
+    event_type_keywords = {
+        "has_auction": "AUCTION", "has_gala": "GALA", "has_raffle": "RAFFLE",
+        "has_ball": "BALL", "has_dinner": "DINNER", "has_benefit": "BENEFIT",
+        "has_tournament": "TOURNAMENT", "has_golf": "GOLF", "has_fundraiser": "FUNDRAISER",
+        "has_festival": "FESTIVAL", "has_run": "RUN", "has_art": "ART",
+        "has_casino": "CASINO", "has_show": "SHOW", "has_night": "NIGHT",
+    }
+    active_keywords = [kw for key, kw in event_type_keywords.items() if data.get(key)]
+    if active_keywords:
+        kw_parts = []
+        for kw in active_keywords:
+            kw_parts.append("(Event1Keyword = %s OR Event2Keyword = %s)")
+            params.append(kw)
+            params.append(kw)
+        conditions.append("(" + " OR ".join(kw_parts) + ")")
+
+    if data.get("has_website"):
+        conditions.append("Website IS NOT NULL AND Website != ''")
+
+    amount_fields = {
+        "total_revenue": "TotalRevenue",
+        "gross_receipts": "GrossReceipts",
+        "net_income": "NetIncome",
+        "total_assets": "TotalAssets",
+        "contributions": "ContributionsReceived",
+        "program_revenue": "ProgramServiceRevenue",
+        "fundraising_income": "FundraisingGrossIncome",
+        "fundraising_expenses": "FundraisingDirectExpenses",
+        "event1_receipts": "Event1GrossReceipts",
+        "event1_contributions": "Event1CharitableContributions",
+        "event1_revenue": "Event1GrossRevenue",
+        "event1_rent": "Event1RentCosts",
+        "event1_food": "Event1FoodBeverage",
+        "event1_expenses": "Event1OtherExpenses",
+        "event1_net": "Event1NetIncome",
+        "event2_receipts": "Event2GrossReceipts",
+        "event2_contributions": "Event2CharitableContributions",
+        "event2_revenue": "Event2GrossRevenue",
+    }
+    for key, col in amount_fields.items():
+        _add_amount_filter(conditions, params, col, data.get(key, ""))
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+    query = f"""
+        SELECT
+            EIN, OrganizationName, Website, PhysicalAddress, PhysicalCity, PhysicalState, PhysicalZIP,
+            BusinessOfficerPhone, PrincipalOfficerName,
+            TotalRevenue, GrossReceipts, NetIncome, TotalAssets, ContributionsReceived,
+            ProgramServiceRevenue, FundraisingGrossIncome, FundraisingDirectExpenses,
+            Event1Name, Event1GrossReceipts, Event1GrossRevenue, Event1NetIncome,
+            Event2Name, Event2GrossReceipts, Event2GrossRevenue,
+            Event1Keyword, Event2Keyword, PrimaryEventType, ProspectTier,
+            Region5, MissionDescriptionShort
+        FROM tax_year_2019_search
+        WHERE {where}
+        ORDER BY TotalRevenue DESC
+        LIMIT {limit}
+    """
+
+    try:
+        conn = get_irs_db()
+        cursor = conn.cursor()
+        cursor.execute(query, tuple(params))
+        columns = [desc[0] for desc in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn.close()
+        return jsonify({"count": len(rows), "results": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/irs/states")
+@login_required
+def irs_states():
+    try:
+        conn = get_irs_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT PhysicalState FROM tax_year_2019_search WHERE PhysicalState IS NOT NULL ORDER BY PhysicalState")
+        states = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return jsonify(states)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─── HTML Templates ──────────────────────────────────────────────────────────
+
+_BASE_STYLE = """
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #000000; color: #f5f5f5; }
+  .auth-box { background: #000000; border: 1px solid #262626; border-radius: 12px; padding: 40px; width: 420px; text-align: center; }
+  .auth-box p.sub { color: #a3a3a3; margin-bottom: 24px; font-size: 14px; }
+  .auth-box input { width: 100%; padding: 12px 16px; background: #000000; border: 1px solid #333333; border-radius: 8px; color: #f5f5f5; font-size: 16px; margin-bottom: 12px; outline: none; }
+  .auth-box input:focus { border-color: #eab308; }
+  .auth-box button { width: 100%; padding: 12px; background: #ffd900; color: #000000; border: none; border-radius: 8px; font-size: 16px; cursor: pointer; font-weight: 600; margin-top: 4px; }
+  .auth-box button:hover { background: #ca8a04; }
+  .error { color: #f87171; margin-bottom: 16px; font-size: 14px; }
+  .success { color: #4ade80; margin-bottom: 16px; font-size: 14px; }
+  .auth-box .link { color: #a3a3a3; font-size: 13px; margin-top: 16px; }
+  .auth-box .link a { color: #eab308; text-decoration: none; }
+  .auth-box .link a:hover { text-decoration: underline; }
+"""
+
+REGISTER_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Register</title>
+<style>{_BASE_STYLE}
+  body {{ display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
+  .auth-box {{ width: 460px; }}
+  .promo-section {{ background: #0a0a0a; border: 1px dashed #333; border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; }}
+  .promo-section label {{ font-size: 12px; color: #eab308; display: block; margin-bottom: 6px; font-weight: 600; }}
+  .promo-section input {{ margin-bottom: 0; }}
+  .promo-hint {{ font-size: 11px; color: #737373; margin-top: 6px; }}
+  .field-hint {{ font-size: 11px; color: #525252; margin-top: -8px; margin-bottom: 12px; }}
+</style>
+</head>
+<body>
+<form class="auth-box" method="POST" action="/register">
+  <img src="/static/logo_dark.png" alt="Auction Intel" style="height:48px;margin-bottom:16px;">
+  <p class="sub">Create your account</p>
+  <!-- error -->
+  <input type="text" name="company" placeholder="Company name" required>
+  <input type="email" name="email" placeholder="Work email address" autofocus required>
+  <p class="field-hint">Work email required (no Gmail, Yahoo, etc.)</p>
+  <input type="tel" name="phone" placeholder="Phone number" required>
+  <input type="password" name="password" placeholder="Password (min 6 chars)" required>
+  <input type="password" name="confirm" placeholder="Confirm password" required>
+  <div class="promo-section">
+    <label>Have a promo code?</label>
+    <input type="text" name="promo_code" placeholder="Enter promo code for free trial" style="text-transform:uppercase;">
+    <p class="promo-hint">Enter code for a free 7-day trial with $50 credit. No credit card needed.</p>
+  </div>
+  <button type="submit">Create Account</button>
+  <p class="link">Already have an account? <a href="/login">Log in</a></p>
+</form>
+</body>
+</html>"""
+
+LOGIN_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Login</title>
+<style>{_BASE_STYLE}
+  body {{ display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
+</style>
+</head>
+<body>
+<form class="auth-box" method="POST" action="/login">
+  <img src="/static/logo_dark.png" alt="Auction Intel" style="height:48px;margin-bottom:16px;">
+  <p class="sub">Nonprofit Auction Event Finder</p>
+  <!-- error -->
+  <input type="email" name="email" placeholder="Email address" autofocus required>
+  <input type="password" name="password" placeholder="Password" required>
+  <button type="submit">Log In</button>
+  <p class="link"><a href="/forgot-password">Forgot password?</a></p>
+  <p class="link">Don't have an account? <a href="/register">Create New Account</a></p>
+</form>
+</body>
+</html>"""
+
+FORGOT_PASSWORD_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Forgot Password</title>
+<style>{_BASE_STYLE}
+  body {{ display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
+</style>
+</head>
+<body>
+<form class="auth-box" method="POST" action="/forgot-password">
+  <img src="/static/logo_dark.png" alt="Auction Intel" style="height:48px;margin-bottom:16px;">
+  <p class="sub">Reset your password</p>
+  <!-- message -->
+  <input type="email" name="email" placeholder="Email address" autofocus required>
+  <button type="submit">Send Reset Link</button>
+  <p class="link"><a href="/login">Back to login</a></p>
+</form>
+</body>
+</html>"""
+
+RESET_PASSWORD_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Reset Password</title>
+<style>{_BASE_STYLE}
+  body {{ display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
+</style>
+</head>
+<body>
+<form class="auth-box" method="POST" action="/reset-password">
+  <img src="/static/logo_dark.png" alt="Auction Intel" style="height:48px;margin-bottom:16px;">
+  <p class="sub">Set a new password</p>
+  <!-- error -->
+  <input type="hidden" name="token" value="{{{{TOKEN}}}}">
+  <input type="password" name="password" placeholder="New password (min 6 chars)" autofocus required>
+  <input type="password" name="confirm" placeholder="Confirm new password" required>
+  <button type="submit">Reset Password</button>
+  <p class="link"><a href="/login">Back to login</a></p>
+</form>
+</body>
+</html>"""
+
+WALLET_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Wallet</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Consolas', monospace; background: #121212; color: #f5f5f5; min-height: 100vh; }
+  .header { background: #000000; border-bottom: 1px solid #262626; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+  .header nav { display: flex; gap: 16px; align-items: center; }
+  .header nav a { color: #a3a3a3; text-decoration: none; font-size: 13px; padding: 6px 12px; border-radius: 6px; }
+  .header nav a:hover, .header nav a.active { color: #f5f5f5; background: #1a1a1a; }
+  .container { max-width: 800px; margin: 0 auto; padding: 24px; }
+  .balance-card { background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 32px; text-align: center; margin-bottom: 24px; }
+  .balance-card .amount { font-size: 48px; font-weight: 700; color: #4ade80; margin: 16px 0; }
+  .balance-card .label { color: #a3a3a3; font-size: 14px; text-transform: uppercase; }
+  .topup-section { background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+  .topup-section h3 { font-size: 16px; margin-bottom: 12px; color: #d4d4d4; }
+  .topup-row { display: flex; gap: 12px; align-items: center; }
+  .topup-row input { flex: 1; padding: 12px; background: #000000; border: 1px solid #333; border-radius: 8px; color: #f5f5f5; font-size: 16px; font-family: inherit; outline: none; }
+  .topup-row input:focus { border-color: #eab308; }
+  .topup-row button { padding: 12px 24px; background: #ffd900; color: #000; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; white-space: nowrap; }
+  .topup-row button:hover { background: #ca8a04; }
+  .topup-hint { color: #737373; font-size: 12px; margin-top: 8px; }
+  .txn-section { background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 24px; }
+  .txn-section h3 { font-size: 16px; margin-bottom: 12px; color: #d4d4d4; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { color: #a3a3a3; text-transform: uppercase; font-size: 10px; padding: 8px 6px; text-align: left; border-bottom: 1px solid #262626; }
+  td { padding: 8px 6px; border-bottom: 1px solid #1a1a1a; color: #d4d4d4; }
+  .user-badge { color: #a3a3a3; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <a href="/"><img src="/static/logo_dark.png" alt="Auction Intel" style="height:32px;"></a>
+  <nav>
+    <a href="/">Auction Search</a>
+    <a href="/database">Database</a>
+    <a href="/wallet" class="active">Wallet</a>
+    <a href="/results">Results</a>
+    <a href="/billing">Billing</a>
+    <a href="/profile">Profile</a>
+    <span class="user-badge">{{EMAIL}}</span>
+    <a href="/logout">Logout</a>
+  </nav>
+</div>
+<div class="container">
+  <div class="balance-card">
+    <div class="label">Wallet Balance</div>
+    <div class="amount">{{BALANCE}}</div>
+  </div>
+
+  <div class="topup-section">
+    <h3>Add Funds</h3>
+    <div class="topup-row">
+      <input type="number" id="topupAmount" placeholder="Amount in USD" min="250" max="9999" step="1" value="500">
+      <button onclick="topUp()">Add Funds via Stripe</button>
+    </div>
+    <p class="topup-hint">Minimum $250, maximum $9,999 per top-up</p>
+  </div>
+
+  <div class="txn-section">
+    <h3>Transaction History</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Description</th></tr></thead>
+      <tbody>{{TXN_ROWS}}</tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+async function topUp() {
+  const amount = document.getElementById('topupAmount').value;
+  if (!amount || amount < 250 || amount > 9999) {
+    alert('Amount must be between $250 and $9,999');
+    return;
+  }
+  try {
+    const res = await fetch('/api/wallet/topup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount: parseFloat(amount) }),
+    });
+    const data = await res.json();
+    if (data.url) {
+      window.location.href = data.url;
+    } else {
+      alert(data.error || 'Failed to create checkout session');
+    }
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+</script>
+</body>
+</html>"""
+
+PROFILE_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Profile</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: 'SF Mono', 'Consolas', monospace; background: #121212; color: #f5f5f5; min-height: 100vh; }}
+  .header {{ background: #000000; border-bottom: 1px solid #262626; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }}
+  .header nav {{ display: flex; gap: 16px; align-items: center; }}
+  .header nav a {{ color: #a3a3a3; text-decoration: none; font-size: 13px; padding: 6px 12px; border-radius: 6px; }}
+  .header nav a:hover, .header nav a.active {{ color: #f5f5f5; background: #1a1a1a; }}
+  .container {{ max-width: 800px; margin: 0 auto; padding: 24px; }}
+  .card {{ background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 24px; margin-bottom: 24px; }}
+  .card h3 {{ font-size: 16px; margin-bottom: 16px; color: #d4d4d4; }}
+  .info-row {{ display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #1a1a1a; }}
+  .info-row:last-child {{ border-bottom: none; }}
+  .info-row .label {{ color: #a3a3a3; font-size: 13px; }}
+  .info-row .value {{ font-size: 13px; font-weight: 600; }}
+  .info-row .value.admin {{ color: #eab308; }}
+  .info-row .value.balance {{ color: #4ade80; }}
+  input {{ width: 100%; padding: 10px 14px; background: #000000; border: 1px solid #333; border-radius: 8px; color: #f5f5f5; font-size: 14px; font-family: inherit; outline: none; margin-bottom: 12px; }}
+  input:focus {{ border-color: #eab308; }}
+  button {{ padding: 10px 24px; background: #ffd900; color: #000; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; }}
+  button:hover {{ background: #ca8a04; }}
+  .alert {{ padding: 12px 16px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }}
+  .alert.error {{ background: #f8717122; color: #f87171; border: 1px solid #f8717144; }}
+  .alert.success {{ background: #4ade8022; color: #4ade80; border: 1px solid #4ade8044; }}
+  .stats-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }}
+  .stat-item {{ background: #000000; border-radius: 8px; padding: 16px; text-align: center; }}
+  .stat-item .num {{ font-size: 24px; font-weight: 700; color: #eab308; }}
+  .stat-item .lbl {{ font-size: 11px; color: #a3a3a3; text-transform: uppercase; margin-top: 4px; }}
+  .user-badge {{ color: #a3a3a3; font-size: 12px; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <a href="/"><img src="/static/logo_dark.png" alt="Auction Intel" style="height:32px;"></a>
+  <nav>
+    <a href="/">Auction Search</a>
+    <a href="/database">Database</a>
+    <a href="/wallet">Wallet</a>
+    <a href="/billing">Billing</a>
+    <a href="/profile" class="active">Profile</a>
+    <span class="user-badge">{{{{EMAIL}}}}</span>
+    <a href="/logout">Logout</a>
+  </nav>
+</div>
+<div class="container">
+  <div id="alerts"></div>
+
+  <div class="card">
+    <h3>Account Information</h3>
+    <div class="info-row"><span class="label">Email</span><span class="value">{{{{EMAIL}}}}</span></div>
+    <div class="info-row"><span class="label">Account Type</span><span class="value admin">{{{{ACCOUNT_TYPE}}}}</span></div>
+    <div class="info-row"><span class="label">Member Since</span><span class="value">{{{{CREATED_AT}}}}</span></div>
+    <div class="info-row"><span class="label">Current Balance</span><span class="value balance">{{{{BALANCE}}}}</span></div>
+  </div>
+
+  <div class="card">
+    <h3>Account Stats</h3>
+    <div class="stats-grid">
+      <div class="stat-item"><div class="num">{{{{JOB_COUNT}}}}</div><div class="lbl">Total Searches</div></div>
+      <div class="stat-item"><div class="num">{{{{TOTAL_SPENT}}}}</div><div class="lbl">Total Spent</div></div>
+      <div class="stat-item"><div class="num">{{{{TOTAL_TOPUPS}}}}</div><div class="lbl">Total Funded</div></div>
+      <div class="stat-item"><div class="num">{{{{BALANCE}}}}</div><div class="lbl">Current Balance</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Change Password</h3>
+    <form method="POST" action="/profile/password">
+      <input type="password" name="current_password" placeholder="Current password" required>
+      <input type="password" name="new_password" placeholder="New password (min 6 chars)" required>
+      <input type="password" name="confirm_password" placeholder="Confirm new password" required>
+      <button type="submit">Update Password</button>
+    </form>
+  </div>
+</div>
+<script>
+(function() {{
+  const params = new URLSearchParams(window.location.search);
+  const alerts = document.getElementById('alerts');
+  if (params.get('error') === 'current') alerts.innerHTML = '<div class="alert error">Current password is incorrect.</div>';
+  else if (params.get('error') === 'length') alerts.innerHTML = '<div class="alert error">New password must be at least 6 characters.</div>';
+  else if (params.get('error') === 'match') alerts.innerHTML = '<div class="alert error">New passwords do not match.</div>';
+  else if (params.get('success') === '1') alerts.innerHTML = '<div class="alert success">Password updated successfully.</div>';
+}})();
+</script>
+</body>
+</html>"""
+
+BILLING_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Billing</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Consolas', monospace; background: #121212; color: #f5f5f5; min-height: 100vh; }
+  .header { background: #000000; border-bottom: 1px solid #262626; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+  .header nav { display: flex; gap: 16px; align-items: center; }
+  .header nav a { color: #a3a3a3; text-decoration: none; font-size: 13px; padding: 6px 12px; border-radius: 6px; }
+  .header nav a:hover, .header nav a.active { color: #f5f5f5; background: #1a1a1a; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 24px; }
+  .summary-card { background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 20px; text-align: center; }
+  .summary-card .amount { font-size: 28px; font-weight: 700; margin: 8px 0; }
+  .summary-card .amount.green { color: #4ade80; }
+  .summary-card .amount.red { color: #f87171; }
+  .summary-card .amount.gold { color: #eab308; }
+  .summary-card .amount.blue { color: #60a5fa; }
+  .summary-card .label { font-size: 11px; color: #a3a3a3; text-transform: uppercase; }
+  .section { background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+  .section h3 { font-size: 16px; margin-bottom: 16px; color: #d4d4d4; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { color: #a3a3a3; text-transform: uppercase; font-size: 10px; padding: 8px 6px; text-align: left; border-bottom: 1px solid #262626; }
+  td { padding: 8px 6px; border-bottom: 1px solid #1a1a1a; color: #d4d4d4; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tabs button { padding: 8px 16px; background: #1a1a1a; border: 1px solid #333; color: #a3a3a3; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 12px; }
+  .tabs button.active { background: #262626; color: #f5f5f5; border-color: #eab308; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .user-badge { color: #a3a3a3; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <a href="/"><img src="/static/logo_dark.png" alt="Auction Intel" style="height:32px;"></a>
+  <nav>
+    <a href="/">Auction Search</a>
+    <a href="/database">Database</a>
+    <a href="/wallet">Wallet</a>
+    <a href="/billing" class="active">Billing</a>
+    <a href="/profile">Profile</a>
+    <span class="user-badge">{{EMAIL}}</span>
+    <a href="/logout">Logout</a>
+  </nav>
+</div>
+<div class="container">
+  <div class="summary-grid">
+    <div class="summary-card">
+      <div class="label">Current Balance</div>
+      <div class="amount green">{{BALANCE}}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Total Spent</div>
+      <div class="amount red">{{TOTAL_SPENT}}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Research Fees</div>
+      <div class="amount gold">{{RESEARCH_FEES}}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Lead Fees</div>
+      <div class="amount gold">{{LEAD_FEES}}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Total Top-Ups</div>
+      <div class="amount blue">{{TOTAL_TOPUPS}}</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="tabs">
+      <button class="active" onclick="showTab('jobs')">Job History ({{JOB_COUNT}})</button>
+      <button onclick="showTab('txns')">All Transactions</button>
+    </div>
+
+    <div id="tab-jobs" class="tab-content active">
+      <table>
+        <thead><tr><th>Date</th><th>Status</th><th>Searched</th><th>Found</th><th>Billable</th><th>Cost</th><th>Downloads</th></tr></thead>
+        <tbody>{{JOB_ROWS}}</tbody>
+      </table>
+    </div>
+
+    <div id="tab-txns" class="tab-content">
+      <table>
+        <thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Description</th><th>Job ID</th></tr></thead>
+        <tbody>{{TXN_ROWS}}</tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+function showTab(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tabs button').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  event.target.classList.add('active');
+}
+</script>
+</body>
+</html>"""
+
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: #121212; color: #f5f5f5; min-height: 100vh; }
+
+  .header { background: #000000; border-bottom: 1px solid #262626; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { font-size: 20px; color: #eab308; }
+  .header .logout { color: #a3a3a3; text-decoration: none; font-size: 13px; }
+  .header .logout:hover { color: #f87171; }
+
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  .balance-bar { background: #111111; border: 1px solid #262626; border-radius: 8px; padding: 12px 20px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+  .balance-bar .bal { color: #4ade80; font-weight: 700; }
+  .balance-bar .fee-est { color: #a3a3a3; }
+  .balance-bar a { color: #eab308; text-decoration: none; font-size: 12px; }
+
+  .input-section { background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+  .input-section h2 { font-size: 16px; margin-bottom: 12px; color: #d4d4d4; }
+  .input-section textarea { width: 100%; height: 160px; background: #000000; border: 1px solid #333333; border-radius: 8px; color: #f5f5f5; padding: 12px; font-family: inherit; font-size: 13px; resize: vertical; outline: none; }
+  .input-section textarea:focus { border-color: #eab308; }
+  .input-section textarea::placeholder { color: #737373; }
+
+  .controls { display: flex; gap: 12px; margin-top: 16px; align-items: center; }
+  .controls button { padding: 10px 24px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  .btn-primary { background: #ffd900; color: #000000; }
+  .btn-primary:hover { background: #ca8a04; }
+  .btn-primary:disabled { background: #333333; cursor: not-allowed; }
+  .btn-secondary { background: #1a1a1a; color: #f5f5f5; }
+  .btn-secondary:hover { background: #333333; }
+  .count-label { color: #a3a3a3; font-size: 13px; margin-left: auto; }
+
+  .progress-section { display: none; background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+  .progress-bar-container { background: #000000; border-radius: 8px; height: 32px; overflow: hidden; margin-bottom: 16px; position: relative; }
+  .progress-bar { height: 100%; background: linear-gradient(90deg, #ca8a04, #eab308); border-radius: 8px; transition: width 0.3s ease; width: 0%; }
+  .progress-text { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 13px; font-weight: 600; color: white; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .stat { background: #000000; border-radius: 8px; padding: 12px; text-align: center; }
+  .stat .num { font-size: 24px; font-weight: 700; }
+  .stat .label { font-size: 11px; color: #a3a3a3; text-transform: uppercase; margin-top: 4px; }
+  .stat.found .num { color: #4ade80; }
+  .stat.external .num { color: #eab308; }
+  .stat.notfound .num { color: #f87171; }
+  .stat.uncertain .num { color: #fbbf24; }
+
+  .terminal { background: #000000; border: 1px solid #262626; border-radius: 8px; padding: 16px; max-height: 400px; overflow-y: auto; font-size: 13px; line-height: 1.6; }
+  .terminal .line { padding: 2px 0; }
+  .terminal .line.processing { color: #a3a3a3; }
+  .terminal .line.found { color: #4ade80; }
+  .terminal .line.external_found { color: #eab308; }
+  .terminal .line.not_found { color: #f87171; }
+  .terminal .line.uncertain { color: #fbbf24; }
+  .terminal .line.error { color: #f87171; }
+  .terminal .line.info { color: #eab308; }
+  .terminal .line.complete { color: #4ade80; font-weight: 700; }
+  .terminal .timestamp { color: #404040; margin-right: 8px; }
+
+  .billing-summary { background: #0a0a0a; border: 1px solid #262626; border-radius: 8px; padding: 16px; margin-top: 16px; font-size: 13px; line-height: 1.8; display: none; }
+  .billing-summary .row { display: flex; justify-content: space-between; }
+  .billing-summary .total { border-top: 1px solid #333; padding-top: 8px; margin-top: 8px; font-weight: 700; color: #eab308; }
+
+  .download-section { display: none; margin-top: 16px; padding-top: 16px; border-top: 1px solid #262626; }
+  .download-section .dl-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .download-section a, .download-section button { display: inline-block; padding: 10px 20px; background: #ffd900; color: #000000; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; font-family: inherit; }
+  .download-section a:hover, .download-section button:hover { filter: brightness(0.9); }
+  .download-section a.json-btn { background: #7c3aed; }
+  .download-section a.xlsx-btn { background: #2563eb; }
+  .download-section button.view-btn { background: #0891b2; }
+
+  .json-viewer { display: none; margin-top: 16px; background: #000000; border: 1px solid #262626; border-radius: 8px; padding: 16px; max-height: 500px; overflow: auto; }
+  .json-viewer pre { font-size: 12px; line-height: 1.5; color: #f5f5f5; white-space: pre-wrap; word-break: break-word; }
+  .json-viewer .key { color: #eab308; }
+  .json-viewer .string { color: #4ade80; }
+  .json-viewer .number { color: #fbbf24; }
+  .user-badge { color: #a3a3a3; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <a href="/"><img src="/static/logo_dark.png" alt="Auction Intel" style="height:32px;"></a>
+  <nav style="display:flex;gap:16px;align-items:center;">
+    <a href="/" style="color:#f5f5f5;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;background:#1a1a1a;">Auction Search</a>
+    <a href="/database" style="color:#a3a3a3;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;">Database</a>
+    <a href="/wallet" style="color:#a3a3a3;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;">Wallet</a>
+    <a href="/results" style="color:#a3a3a3;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;">Results</a>
+    <a href="/billing" style="color:#a3a3a3;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;">Billing</a>
+    <a href="/profile" style="color:#a3a3a3;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;">Profile</a>
+    <span class="user-badge">{{EMAIL}}</span>
+    <a href="/logout" style="color:#a3a3a3;text-decoration:none;font-size:13px;">Logout</a>
+  </nav>
+</div>
+
+<div class="container">
+  <div class="balance-bar" id="balanceBar" style="display:none;">
+    <span>Balance: <span class="bal" id="balDisplay">$0.00</span></span>
+    <span class="fee-est" id="feeEstimate"></span>
+    <a href="/wallet">Top Up</a>
+  </div>
+
+  <div class="input-section">
+    <h2>Enter Nonprofit Domains or Names</h2>
+    <textarea id="input" placeholder="Paste nonprofit domains or names here, one per line or comma-separated...&#10;&#10;Example:&#10;National Museum of Mexican Art&#10;Radio Milwaukee&#10;driveagainstdiabetes.org"></textarea>
+    <div class="controls">
+      <button class="btn-primary" id="searchBtn" onclick="startSearch()">Search for Auctions</button>
+      <button class="btn-secondary" onclick="document.getElementById('input').value='';updateCount()">Clear</button>
+      <span class="count-label" id="countLabel">0 nonprofits</span>
+    </div>
+  </div>
+
+  <div class="progress-section" id="progressSection">
+    <div class="progress-bar-container">
+      <div class="progress-bar" id="progressBar"></div>
+      <div class="progress-text" id="progressText">0 / 0</div>
+    </div>
+
+    <div class="stats">
+      <div class="stat found"><div class="num" id="statFound">0</div><div class="label">Found</div></div>
+      <div class="stat external"><div class="num" id="statExternal">0</div><div class="label">External</div></div>
+      <div class="stat notfound"><div class="num" id="statNotFound">0</div><div class="label">Not Found</div></div>
+      <div class="stat uncertain"><div class="num" id="statUncertain">0</div><div class="label">Uncertain</div></div>
+    </div>
+
+    <div class="terminal" id="terminal"></div>
+
+    <div class="billing-summary" id="billingSummary"></div>
+
+    <div class="download-section" id="downloadSection">
+      <div class="dl-row">
+        <a href="#" id="downloadCsv">Download CSV</a>
+        <a href="#" id="downloadJson" class="json-btn">Download JSON</a>
+        <a href="#" id="downloadXlsx" class="xlsx-btn">Download XLSX</a>
+        <button class="view-btn" onclick="toggleJsonViewer()">View Results (JSON)</button>
+      </div>
+      <div class="json-viewer" id="jsonViewer"><pre id="jsonContent"></pre></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const IS_ADMIN = {{IS_ADMIN}};
+let balanceCents = {{BALANCE_CENTS}};
+
+const inputEl = document.getElementById('input');
+const countLabel = document.getElementById('countLabel');
+const searchBtn = document.getElementById('searchBtn');
+const progressSection = document.getElementById('progressSection');
+const progressBar = document.getElementById('progressBar');
+const progressText = document.getElementById('progressText');
+const terminal = document.getElementById('terminal');
+const downloadSection = document.getElementById('downloadSection');
+const balanceBar = document.getElementById('balanceBar');
+const balDisplay = document.getElementById('balDisplay');
+const feeEstimate = document.getElementById('feeEstimate');
+
+if (!IS_ADMIN) {
+  balanceBar.style.display = 'flex';
+  balDisplay.textContent = '$' + (balanceCents / 100).toFixed(2);
+}
+
+let counts = { found: 0, external_found: 0, not_found: 0, uncertain: 0, error: 0 };
+let processed = 0;
+let totalNonprofits = 0;
+let currentJobId = null;
+let currentEvtSource = null;
+
+// Auto-fill from IRS database selection
+const irsData = sessionStorage.getItem('irs_nonprofits');
+if (irsData) {
+  inputEl.value = irsData;
+  sessionStorage.removeItem('irs_nonprofits');
+  updateCount();
+}
+
+function updateCount() {
+  const items = inputEl.value.replace(/,/g, '\\n').split('\\n').filter(s => s.trim());
+  const n = items.length;
+  countLabel.textContent = n + ' nonprofit' + (n !== 1 ? 's' : '');
+  if (!IS_ADMIN && n > 0) {
+    const fee = n <= 10000 ? 8 : (n <= 50000 ? 7 : 6);
+    const est = (n * fee / 100).toFixed(2);
+    feeEstimate.textContent = '~$' + est + ' research fee for ' + n + ' nonprofits';
+  } else {
+    feeEstimate.textContent = '';
+  }
+}
+
+inputEl.addEventListener('input', updateCount);
+
+function timestamp() {
+  return new Date().toLocaleTimeString('en-US', { hour12: false });
+}
+
+function log(msg, cls) {
+  cls = cls || '';
+  const line = document.createElement('div');
+  line.className = 'line ' + cls;
+  line.innerHTML = '<span class="timestamp">[' + timestamp() + ']</span> ' + escapeHtml(msg);
+  terminal.appendChild(line);
+  terminal.scrollTop = terminal.scrollHeight;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function updateStats() {
+  document.getElementById('statFound').textContent = counts.found;
+  document.getElementById('statExternal').textContent = counts.external_found;
+  document.getElementById('statNotFound').textContent = counts.not_found;
+  document.getElementById('statUncertain').textContent = counts.uncertain + counts.error;
+}
+
+function updateProgress() {
+  const pct = totalNonprofits > 0 ? Math.round((processed / totalNonprofits) * 100) : 0;
+  progressBar.style.width = pct + '%';
+  progressText.textContent = processed + ' / ' + totalNonprofits;
+}
+
+async function startSearch() {
+  const raw = inputEl.value.trim();
+  if (!raw) return;
+
+  // Close any previous EventSource
+  if (currentEvtSource) {
+    currentEvtSource.close();
+    currentEvtSource = null;
+  }
+
+  searchBtn.disabled = true;
+  progressSection.style.display = 'block';
+  downloadSection.style.display = 'none';
+  document.getElementById('billingSummary').style.display = 'none';
+  terminal.innerHTML = '';
+  counts = { found: 0, external_found: 0, not_found: 0, uncertain: 0, error: 0 };
+  processed = 0;
+  totalNonprofits = 0;
+  updateStats();
+  updateProgress();
+
+  log('Starting search...', 'info');
+
+  try {
+    const res = await fetch('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonprofits: raw }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      log('Error: ' + (err.error || 'Unknown error'), 'error');
+      searchBtn.disabled = false;
+      return;
+    }
+
+    const { job_id, total, research_fee_each } = await res.json();
+    totalNonprofits = total;
+    currentJobId = job_id;
+    if (!IS_ADMIN) {
+      log('Research fee: $' + (total * research_fee_each / 100).toFixed(2) + ' (' + total + ' x $' + (research_fee_each/100).toFixed(2) + ')', 'info');
+    }
+    log('Job started: ' + job_id + ' (' + total + ' nonprofits)', 'info');
+    updateProgress();
+
+    currentEvtSource = new EventSource('/api/progress/' + job_id);
+
+    currentEvtSource.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+
+      switch (data.type) {
+        case 'started':
+          log('Processing ' + data.total + ' nonprofits in ' + data.batches + ' batch(es)', 'info');
+          break;
+
+        case 'processing':
+          log('[' + data.index + '/' + data.total + '] Researching: ' + data.nonprofit, 'processing');
+          break;
+
+        case 'balance':
+          if (!IS_ADMIN) {
+            balanceCents = data.balance;
+            balDisplay.textContent = '$' + (balanceCents / 100).toFixed(2);
+          }
+          break;
+
+        case 'result':
+          processed++;
+          const status = data.status || 'uncertain';
+          if (counts.hasOwnProperty(status)) counts[status]++;
+          else counts.uncertain++;
+
+          let msg = '[' + data.index + '/' + data.total + '] ' + status.toUpperCase() + ': ' + data.nonprofit;
+          if (IS_ADMIN && data.event_title) msg += ' -> ' + data.event_title;
+          if (data.tier && data.tier !== 'not_billable') msg += ' [' + data.tier + ']';
+
+          log(msg, status);
+          updateStats();
+          updateProgress();
+          break;
+
+        case 'batch_done':
+          log('--- Batch complete: ' + data.processed + '/' + data.total + ' processed ---', 'info');
+          break;
+
+        case 'complete':
+          log('', '');
+          log('SEARCH COMPLETE in ' + data.elapsed + 's', 'complete');
+          log('Found: ' + data.summary.found + ' | External: ' + data.summary.external_found +
+              ' | Not Found: ' + data.summary.not_found + ' | Uncertain: ' + data.summary.uncertain, 'complete');
+
+          // Show billing summary for non-admin
+          if (!IS_ADMIN && data.billing) {
+            const bs = document.getElementById('billingSummary');
+            const b = data.billing;
+            let html = '<div class="row"><span>Searched: ' + totalNonprofits + ' nonprofits</span><span>$' + (b.research_fees / 100).toFixed(2) + '</span></div>';
+            if (b.lead_fees) {
+              for (const [tier, info] of Object.entries(b.lead_fees)) {
+                html += '<div class="row"><span>' + info.count + ' ' + tier + ' leads x $' + (info.price_each / 100).toFixed(2) + '</span><span>$' + (info.total / 100).toFixed(2) + '</span></div>';
+              }
+            }
+            html += '<div class="row total"><span>Total charged</span><span>$' + (b.total_charged / 100).toFixed(2) + '</span></div>';
+            html += '<div class="row"><span>Remaining balance</span><span style="color:#4ade80">$' + (data.balance / 100).toFixed(2) + '</span></div>';
+            if (data.billable_count !== undefined) {
+              html += '<div class="row" style="margin-top:8px;color:#a3a3a3;"><span>Billable leads in download: ' + data.billable_count + '</span></div>';
+            }
+            bs.innerHTML = html;
+            bs.style.display = 'block';
+            balanceCents = data.balance;
+            balDisplay.textContent = '$' + (balanceCents / 100).toFixed(2);
+          }
+
+          const completedJobId = data.job_id || currentJobId;
+          downloadSection.style.display = 'block';
+          document.getElementById('downloadCsv').href = '/api/download/' + completedJobId + '/csv';
+          document.getElementById('downloadJson').href = '/api/download/' + completedJobId + '/json';
+          document.getElementById('downloadXlsx').href = '/api/download/' + completedJobId + '/xlsx';
+
+          searchBtn.disabled = false;
+          currentEvtSource.close();
+          currentEvtSource = null;
+          break;
+
+        case 'error':
+          log('ERROR: ' + data.message, 'error');
+          searchBtn.disabled = false;
+          currentEvtSource.close();
+          currentEvtSource = null;
+          break;
+
+        case 'heartbeat':
+          break;
+      }
+    };
+
+    currentEvtSource.onerror = () => {
+      log('Connection lost. Check results below if available.', 'error');
+      searchBtn.disabled = false;
+      if (currentEvtSource) { currentEvtSource.close(); currentEvtSource = null; }
+    };
+
+  } catch (err) {
+    log('Request failed: ' + err.message, 'error');
+    searchBtn.disabled = false;
+  }
+}
+
+function syntaxHighlight(json) {
+  json = json.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return json.replace(/("(\\\\u[a-zA-Z0-9]{4}|\\\\[^u]|[^\\\\"])*"(\\s*:)?|\\b(true|false|null)\\b|-?\\d+(?:\\.\\d*)?(?:[eE][+\\-]?\\d+)?)/g, function (match) {
+    let cls = 'number';
+    if (/^"/.test(match)) {
+      if (/:$/.test(match)) { cls = 'key'; }
+      else { cls = 'string'; }
+    }
+    return '<span class="' + cls + '">' + match + '</span>';
+  });
+}
+
+async function toggleJsonViewer() {
+  const viewer = document.getElementById('jsonViewer');
+  const content = document.getElementById('jsonContent');
+
+  if (viewer.style.display === 'block') {
+    viewer.style.display = 'none';
+    return;
+  }
+
+  if (!currentJobId) return;
+
+  content.textContent = 'Loading results...';
+  viewer.style.display = 'block';
+
+  try {
+    const res = await fetch('/api/results/' + currentJobId);
+    const data = await res.json();
+    content.innerHTML = syntaxHighlight(JSON.stringify(data, null, 2));
+  } catch (err) {
+    content.textContent = 'Failed to load results: ' + err.message;
+  }
+}
+</script>
+</body>
+</html>"""
+
+DATABASE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Search Nonprofit Database</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Consolas', monospace; background: #121212; color: #f5f5f5; min-height: 100vh; }
+  .header { background: #000000; border-bottom: 1px solid #262626; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { font-size: 20px; color: #eab308; }
+  .header nav { display: flex; gap: 16px; align-items: center; }
+  .header nav a { color: #a3a3a3; text-decoration: none; font-size: 13px; padding: 6px 12px; border-radius: 6px; }
+  .header nav a:hover, .header nav a.active { color: #f5f5f5; background: #1a1a1a; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+  .filters { background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+  .filters h2 { font-size: 16px; margin-bottom: 4px; color: #d4d4d4; }
+  .filters .subtitle { font-size: 12px; color: #737373; margin-bottom: 16px; }
+  .section-title { font-size: 12px; color: #eab308; text-transform: uppercase; font-weight: 700; margin: 16px 0 8px; padding-top: 12px; border-top: 1px solid #262626; }
+  .section-title:first-of-type { margin-top: 0; padding-top: 0; border-top: none; }
+  .filter-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .fg { display: flex; flex-direction: column; gap: 3px; }
+  .fg label { font-size: 10px; color: #a3a3a3; text-transform: uppercase; letter-spacing: 0.5px; }
+  .fg input, .fg select { padding: 7px 10px; background: #000000; border: 1px solid #333333; border-radius: 6px; color: #f5f5f5; font-family: inherit; font-size: 12px; outline: none; }
+  .fg input:focus, .fg select:focus { border-color: #eab308; }
+
+  .checkboxes { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+  .checkboxes label { font-size: 12px; display: flex; align-items: center; gap: 5px; cursor: pointer; color: #d4d4d4; }
+  .checkboxes input[type="checkbox"] { accent-color: #eab308; }
+
+  .controls { display: flex; gap: 12px; margin-top: 16px; align-items: center; padding-top: 12px; border-top: 1px solid #262626; }
+  .controls button { padding: 10px 24px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  .btn-primary { background: #ffd900; color: #000000; }
+  .btn-primary:hover { background: #ca8a04; }
+  .btn-send { background: #ffd900; color: #000000; }
+  .btn-send:hover { background: #047857; }
+  .btn-send:disabled { background: #333333; cursor: not-allowed; }
+  .result-count { color: #a3a3a3; font-size: 13px; margin-left: auto; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th { background: #111111; color: #a3a3a3; text-transform: uppercase; font-size: 9px; padding: 8px 6px; text-align: left; position: sticky; top: 0; border-bottom: 2px solid #262626; }
+  td { padding: 6px; border-bottom: 1px solid #1a1a1a; color: #d4d4d4; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tr:hover td { background: #111111; }
+  td.ck { width: 28px; text-align: center; }
+  td.ck input { accent-color: #eab308; }
+  .tag { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 600; margin-right: 2px; }
+  .tag.gala { background: #7c3aed33; color: #eab308; }
+  .tag.auction { background: #05966933; color: #34d399; }
+  .tag.golf { background: #0891b233; color: #67e8f9; }
+  .tag.dinner { background: #b4560633; color: #fdba74; }
+  .tag.ball { background: #be185d33; color: #f472b6; }
+  .tag.raffle { background: #d9770633; color: #fbbf24; }
+  .tag.run { background: #16a34a33; color: #86efac; }
+  .tag.art { background: #9333ea33; color: #c084fc; }
+  .tag.other { background: #47556933; color: #a3a3a3; }
+  .tier { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+  .tier.aplus { background: #05966933; color: #34d399; }
+  .tier.a { background: #0891b233; color: #67e8f9; }
+  .tier.bplus { background: #ca8a0433; color: #fbbf24; }
+  .tier.c { background: #47556933; color: #a3a3a3; }
+  .table-wrap { max-height: 600px; overflow: auto; border: 1px solid #262626; border-radius: 8px; }
+  a.ws { color: #eab308; text-decoration: none; }
+  a.ws:hover { text-decoration: underline; }
+  .amount-select { min-width: 0; }
+  .user-badge { color: #a3a3a3; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <a href="/"><img src="/static/logo_dark.png" alt="Auction Intel" style="height:32px;"></a>
+  <nav>
+    <a href="/">Auction Search</a>
+    <a href="/database" class="active">Database</a>
+    <a href="/wallet">Wallet</a>
+    <a href="/results">Results</a>
+    <a href="/billing">Billing</a>
+    <a href="/profile">Profile</a>
+    <span class="user-badge">{{EMAIL}}</span>
+    <a href="/logout">Logout</a>
+  </nav>
+</div>
+<div class="container">
+  <div class="filters">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div>
+        <h2>Search Nonprofit Database</h2>
+        <p class="subtitle">276,000 nonprofit organizations with pre-extracted event keywords | Filter and send to Auction Finder</p>
+      </div>
+      <button onclick="toggleFilters()" id="toggleBtn" style="padding:6px 14px;background:#262626;color:#a3a3a3;border:1px solid #333;border-radius:6px;cursor:pointer;font-family:inherit;font-size:12px;white-space:nowrap;">Hide Filters</button>
+    </div>
+
+    <div id="filterBody">
+    <div class="section-title">Organization & Location</div>
+    <div class="filter-grid">
+      <div class="fg"><label>Organization Name</label><input type="text" id="fName" placeholder="e.g. Museum of Art"></div>
+      <div class="fg"><label>State</label><select id="fState"><option value="">All States</option></select></div>
+      <div class="fg"><label>Region</label>
+        <select id="fRegion">
+          <option value="">All Regions</option>
+          <option value="northeast">Northeast (CT,DE,DC,ME,MD,MA,NH,NJ,NY,PA,RI,VT)</option>
+          <option value="southeast">Southeast (AL,AR,FL,GA,KY,LA,MS,NC,SC,TN,VA,WV)</option>
+          <option value="midwest">Midwest (IL,IN,IA,KS,MI,MN,MO,NE,ND,OH,SD,WI)</option>
+          <option value="southwest">Southwest (AZ,NM,OK,TX)</option>
+          <option value="west">West (AK,CA,CO,HI,ID,MT,NV,OR,UT,WA,WY)</option>
+        </select>
+      </div>
+      <div class="fg"><label>City</label><input type="text" id="fCity" placeholder="e.g. Chicago"></div>
+    </div>
+
+    <div class="section-title">Event Type & Classification</div>
+    <div class="filter-grid">
+      <div class="fg"><label>Primary Event Type</label>
+        <select id="fPrimaryType">
+          <option value="">All Types</option>
+          <option value="GALA">Gala</option>
+          <option value="GOLF">Golf</option>
+          <option value="AUCTION">Auction</option>
+          <option value="EVENT">Event</option>
+          <option value="DINNER">Dinner</option>
+          <option value="ART">Art</option>
+          <option value="RUN">Run/Race</option>
+          <option value="FUNDRAISER">Fundraiser</option>
+          <option value="BALL">Ball</option>
+          <option value="SALE">Sale</option>
+          <option value="FAIR">Fair</option>
+          <option value="FESTIVAL">Festival</option>
+          <option value="LUNCHEON">Luncheon</option>
+          <option value="WALK">Walk</option>
+          <option value="RAFFLE">Raffle</option>
+          <option value="CELEBRATION">Celebration</option>
+          <option value="NIGHT">Night</option>
+          <option value="SHOW">Show</option>
+          <option value="ANNUAL">Annual</option>
+          <option value="BANQUET">Banquet</option>
+          <option value="BENEFIT">Benefit</option>
+          <option value="BREAKFAST">Breakfast</option>
+          <option value="CASINO">Casino</option>
+          <option value="TOURNAMENT">Tournament</option>
+          <option value="RACE">Race</option>
+        </select>
+      </div>
+      <div class="fg"><label>Prospect Tier</label>
+        <select id="fTier">
+          <option value="">All Tiers</option>
+          <option value="A+">A+ (Top Prospects)</option>
+          <option value="A">A (High Value)</option>
+          <option value="B+">B+ (Good Prospects)</option>
+          <option value="C">C (Standard)</option>
+        </select>
+      </div>
+      <div class="fg"><label>Event Name Search</label><input type="text" id="fEventKw" placeholder="Free text in Event1/Event2 name"></div>
+      <div class="fg"><label>Mission/Activity Keyword</label><input type="text" id="fMissionKw" placeholder="e.g. children, arts, health"></div>
+    </div>
+    <p style="font-size:10px;color:#64748b;margin-top:6px;">Quick filters (matches Event1Keyword / Event2Keyword):</p>
+    <div class="checkboxes">
+      <label><input type="checkbox" id="fAuction"> Auction</label>
+      <label><input type="checkbox" id="fGala"> Gala</label>
+      <label><input type="checkbox" id="fGolf"> Golf</label>
+      <label><input type="checkbox" id="fDinner"> Dinner</label>
+      <label><input type="checkbox" id="fBall"> Ball</label>
+      <label><input type="checkbox" id="fRaffle"> Raffle</label>
+      <label><input type="checkbox" id="fBenefit"> Benefit</label>
+      <label><input type="checkbox" id="fFundraiser"> Fundraiser</label>
+      <label><input type="checkbox" id="fFestival"> Festival</label>
+      <label><input type="checkbox" id="fRun"> Run/Race</label>
+      <label><input type="checkbox" id="fArt"> Art</label>
+      <label><input type="checkbox" id="fTournament"> Tournament</label>
+      <label><input type="checkbox" id="fCasino"> Casino</label>
+      <label><input type="checkbox" id="fShow"> Show</label>
+      <label><input type="checkbox" id="fNight"> Night</label>
+    </div>
+    <div class="checkboxes" style="margin-top:8px;">
+      <label><input type="checkbox" id="fWebsite" checked> Has Website</label>
+    </div>
+
+    <div class="section-title">Settings</div>
+    <div class="filter-grid">
+      <div class="fg"><label>Max Results</label>
+        <select id="fLimit">
+          <option value="50">50</option><option value="100" selected>100</option>
+          <option value="200">200</option><option value="500">500</option>
+          <option value="1000">1,000</option><option value="2000">2,000</option>
+          <option value="5000">5,000</option><option value="10000">10,000</option>
+        </select>
+      </div>
+      <div class="fg"></div><div class="fg"></div><div class="fg"></div>
+    </div>
+
+    <div class="section-title" style="cursor:pointer;" onclick="document.getElementById('financialFilters').style.display=document.getElementById('financialFilters').style.display==='none'?'':'none';this.querySelector('span').textContent=document.getElementById('financialFilters').style.display==='none'?'+ Show':'- Hide';">Financial Filters <span style="font-size:10px;color:#ffd900;">+ Show</span></div>
+    <div id="financialFilters" style="display:none;">
+    <div class="section-title" style="border-top:none;margin-top:0;padding-top:0;">Organization</div>
+    <div class="filter-grid">
+      <div class="fg"><label>Total Revenue</label><select id="fTotalRevenue" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Gross Receipts</label><select id="fGrossReceipts" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Net Income</label><select id="fNetIncome" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Total Assets</label><select id="fTotalAssets" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Contributions Received</label><select id="fContributions" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Program Service Revenue</label><select id="fProgramRevenue" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Fundraising Gross Income</label><select id="fFundraisingIncome" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Fundraising Expenses</label><select id="fFundraisingExpenses" class="amount-select"><option value="">Any</option></select></div>
+    </div>
+
+    <div class="section-title">Financial Filters (Event 1)</div>
+    <div class="filter-grid">
+      <div class="fg"><label>Event 1 Gross Receipts</label><select id="fE1Receipts" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Event 1 Contributions</label><select id="fE1Contrib" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Event 1 Gross Revenue</label><select id="fE1Revenue" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Event 1 Net Income</label><select id="fE1Net" class="amount-select"><option value="">Any</option></select></div>
+    </div>
+
+    <div class="section-title">Financial Filters (Event 2)</div>
+    <div class="filter-grid">
+      <div class="fg"><label>Event 2 Gross Receipts</label><select id="fE2Receipts" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Event 2 Contributions</label><select id="fE2Contrib" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"><label>Event 2 Gross Revenue</label><select id="fE2Revenue" class="amount-select"><option value="">Any</option></select></div>
+      <div class="fg"></div>
+    </div>
+    </div><!-- /financialFilters -->
+
+    </div><!-- /filterBody -->
+
+    <div class="controls">
+      <button class="btn-primary" onclick="searchIRS()">Search Database</button>
+      <button class="btn-send" id="sendBtn" disabled onclick="sendToFinder()">Add Selected to Queue</button>
+      <button class="btn-send" id="goBtn" style="display:none;" onclick="window.location.href='/'">Go to Auction Finder</button>
+      <span class="result-count" id="resultCount"></span>
+      <span class="result-count" id="queueCount" style="color:#ffd900;"></span>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th><input type="checkbox" id="selectAll" onchange="toggleAll()"></th>
+        <th>Organization</th><th>Website</th><th>City, State</th><th>Region</th>
+        <th>Revenue</th><th>Fundraising</th>
+        <th>Type</th><th>Tier</th><th>Event 1</th><th>Event 2</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const RANGES = [
+  {v:'1-100k',l:'$1 - $100K'},
+  {v:'100k-500k',l:'$100K - $500K'},
+  {v:'500k-1m',l:'$500K - $1M'},
+  {v:'1m-2m',l:'$1M - $2M'},
+  {v:'2m-5m',l:'$2M - $5M'},
+  {v:'5m+',l:'$5M+'}
+];
+
+const TAG_COLORS = {
+  GALA:'gala', AUCTION:'auction', GOLF:'golf', DINNER:'dinner',
+  BALL:'ball', RAFFLE:'raffle', RUN:'run', ART:'art',
+  FESTIVAL:'other', FUNDRAISER:'other', BENEFIT:'other', SALE:'other',
+  SHOW:'other', NIGHT:'other', CASINO:'other', TOURNAMENT:'other',
+  WALK:'run', RACE:'run', LUNCHEON:'dinner', BANQUET:'dinner',
+  BREAKFAST:'dinner', CELEBRATION:'gala', EVENT:'other', ANNUAL:'other',
+  FAIR:'other', BAZAAR:'other', CONCERT:'art', EXHIBIT:'art', MARKET:'other'
+};
+
+document.querySelectorAll('.amount-select').forEach(sel => {
+  RANGES.forEach(r => { const o=document.createElement('option'); o.value=r.v; o.textContent=r.l; sel.appendChild(o); });
+});
+
+fetch('/api/irs/states').then(r=>r.json()).then(states => {
+  const sel=document.getElementById('fState');
+  states.forEach(s => { const o=document.createElement('option'); o.value=s; o.textContent=s; sel.appendChild(o); });
+});
+
+// Show existing queue count on load
+(function(){
+  const q=sessionStorage.getItem('irs_nonprofits');
+  if(q){
+    const n=q.split('\\n').filter(s=>s.trim()).length;
+    if(n>0){
+      document.getElementById('queueCount').textContent=n+' in queue';
+      document.getElementById('goBtn').style.display='';
+    }
+  }
+})();
+
+function fmt(n) { return (n===null||n===undefined)?'-':'$'+Number(n).toLocaleString(); }
+
+function tagHtml(kw) {
+  if(!kw) return '';
+  const cls=TAG_COLORS[kw.toUpperCase()]||'other';
+  return '<span class="tag '+cls+'">'+kw+'</span>';
+}
+
+function tierHtml(t) {
+  if(!t) return '-';
+  const cls = t==='A+'?'aplus':t==='A'?'a':t==='B+'?'bplus':'c';
+  return '<span class="tier '+cls+'">'+t+'</span>';
+}
+
+function searchIRS() {
+  const body = {
+    name: document.getElementById('fName').value,
+    state: document.getElementById('fState').value,
+    region: document.getElementById('fRegion').value,
+    city: document.getElementById('fCity').value,
+    primary_event_type: document.getElementById('fPrimaryType').value,
+    prospect_tier: document.getElementById('fTier').value,
+    event_keyword: document.getElementById('fEventKw').value,
+    mission_keyword: document.getElementById('fMissionKw').value,
+    limit: document.getElementById('fLimit').value,
+    has_auction: document.getElementById('fAuction').checked,
+    has_gala: document.getElementById('fGala').checked,
+    has_raffle: document.getElementById('fRaffle').checked,
+    has_ball: document.getElementById('fBall').checked,
+    has_dinner: document.getElementById('fDinner').checked,
+    has_benefit: document.getElementById('fBenefit').checked,
+    has_tournament: document.getElementById('fTournament').checked,
+    has_golf: document.getElementById('fGolf').checked,
+    has_fundraiser: document.getElementById('fFundraiser').checked,
+    has_festival: document.getElementById('fFestival').checked,
+    has_run: document.getElementById('fRun').checked,
+    has_art: document.getElementById('fArt').checked,
+    has_casino: document.getElementById('fCasino').checked,
+    has_show: document.getElementById('fShow').checked,
+    has_night: document.getElementById('fNight').checked,
+    has_website: document.getElementById('fWebsite').checked,
+    total_revenue: document.getElementById('fTotalRevenue').value,
+    gross_receipts: document.getElementById('fGrossReceipts').value,
+    net_income: document.getElementById('fNetIncome').value,
+    total_assets: document.getElementById('fTotalAssets').value,
+    contributions: document.getElementById('fContributions').value,
+    program_revenue: document.getElementById('fProgramRevenue').value,
+    fundraising_income: document.getElementById('fFundraisingIncome').value,
+    fundraising_expenses: document.getElementById('fFundraisingExpenses').value,
+    event1_receipts: document.getElementById('fE1Receipts').value,
+    event1_contributions: document.getElementById('fE1Contrib').value,
+    event1_revenue: document.getElementById('fE1Revenue').value,
+    event1_net: document.getElementById('fE1Net').value,
+    event2_receipts: document.getElementById('fE2Receipts').value,
+    event2_contributions: document.getElementById('fE2Contrib').value,
+    event2_revenue: document.getElementById('fE2Revenue').value,
+  };
+
+  document.getElementById('resultCount').textContent='Searching...';
+
+  fetch('/api/irs/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(data => {
+      if(data.error){alert(data.error);return;}
+      document.getElementById('resultCount').textContent=data.count+' results';
+      const tbody=document.getElementById('tbody');
+      tbody.innerHTML='';
+      data.results.forEach(r => {
+        const tr=document.createElement('tr');
+        const kw1=r.Event1Keyword||'';
+        const kw2=r.Event2Keyword||'';
+        const ptype=r.PrimaryEventType||'';
+        const tags=[];
+        if(ptype) tags.push(tagHtml(ptype));
+        if(kw1 && kw1!==ptype) tags.push(tagHtml(kw1));
+        if(kw2 && kw2!==ptype && kw2!==kw1) tags.push(tagHtml(kw2));
+        const ws=r.Website?r.Website.toLowerCase().replace(/^https?:\\/\\//,'').replace(/\\/$/,''):'';
+        const wsUrl=ws?(ws.startsWith('http')?ws:'https://'+ws):'';
+        tr.innerHTML=
+          '<td class="ck"><input type="checkbox" data-website="'+ws+'" data-name="'+(r.OrganizationName||'').replace(/"/g,'&quot;')+'" onchange="updateSendBtn()"></td>'+
+          '<td title="'+(r.OrganizationName||'')+'">'+(r.OrganizationName||'-')+'</td>'+
+          '<td>'+(wsUrl?'<a class="ws" href="'+wsUrl+'" target="_blank">'+ws+'</a>':'-')+'</td>'+
+          '<td>'+(r.PhysicalCity||'')+', '+(r.PhysicalState||'')+'</td>'+
+          '<td>'+(r.Region5||'-')+'</td>'+
+          '<td>'+fmt(r.TotalRevenue)+'</td>'+
+          '<td>'+fmt(r.FundraisingGrossIncome)+'</td>'+
+          '<td>'+(tags.join(' ')||'-')+'</td>'+
+          '<td>'+tierHtml(r.ProspectTier)+'</td>'+
+          '<td title="'+(r.Event1Name||'')+'">'+(r.Event1Name||'-')+'</td>'+
+          '<td title="'+(r.Event2Name||'')+'">'+(r.Event2Name||'-')+'</td>';
+        tbody.appendChild(tr);
+      });
+    });
+}
+
+function toggleAll(){
+  const c=document.getElementById('selectAll').checked;
+  document.querySelectorAll('#tbody input[type=checkbox]').forEach(cb=>{cb.checked=c;});
+  updateSendBtn();
+}
+
+function updateSendBtn(){
+  const n=document.querySelectorAll('#tbody input[type=checkbox]:checked').length;
+  const btn=document.getElementById('sendBtn');
+  btn.disabled=n===0;
+  btn.textContent=n>0?'Send '+n+' to Auction Finder':'Send Selected to Auction Finder';
+}
+
+function sendToFinder(){
+  const sel=[];
+  document.querySelectorAll('#tbody input[type=checkbox]:checked').forEach(cb=>{
+    sel.push(cb.dataset.website||cb.dataset.name);
+  });
+  if(!sel.length)return;
+  const existing=sessionStorage.getItem('irs_nonprofits')||'';
+  const combined=existing?(existing+'\\n'+sel.join('\\n')):sel.join('\\n');
+  const unique=[...new Set(combined.split('\\n').filter(s=>s.trim()))];
+  sessionStorage.setItem('irs_nonprofits',unique.join('\\n'));
+  document.getElementById('queueCount').textContent=unique.length+' in queue';
+  document.getElementById('goBtn').style.display='';
+  document.getElementById('selectAll').checked=false;
+  document.querySelectorAll('#tbody input[type=checkbox]').forEach(cb=>{cb.checked=false;});
+  updateSendBtn();
+}
+
+function toggleFilters(){
+  const body=document.getElementById('filterBody');
+  const btn=document.getElementById('toggleBtn');
+  if(body.style.display==='none'){
+    body.style.display='';
+    btn.textContent='Hide Filters';
+  } else {
+    body.style.display='none';
+    btn.textContent='Show Filters';
+  }
+}
+</script>
+</body>
+</html>"""
+
+
+RESULTS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUCTIONFINDER - Results</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Consolas', monospace; background: #121212; color: #f5f5f5; min-height: 100vh; }
+  .header { background: #000000; border-bottom: 1px solid #262626; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+  .header nav { display: flex; gap: 16px; align-items: center; }
+  .header nav a { color: #a3a3a3; text-decoration: none; font-size: 13px; padding: 6px 12px; border-radius: 6px; }
+  .header nav a:hover, .header nav a.active { color: #f5f5f5; background: #1a1a1a; }
+  .container { max-width: 900px; margin: 0 auto; padding: 24px; }
+  h2 { font-size: 18px; color: #d4d4d4; margin-bottom: 8px; }
+  .subtitle { font-size: 12px; color: #737373; margin-bottom: 24px; }
+  .job-card { background: #111111; border: 1px solid #262626; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  .job-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .job-date { font-size: 13px; color: #a3a3a3; }
+  .job-status { font-size: 12px; font-weight: 700; text-transform: uppercase; }
+  .job-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .js { text-align: center; background: #000000; border-radius: 8px; padding: 10px; }
+  .jn { font-size: 20px; font-weight: 700; display: block; }
+  .jl { font-size: 10px; color: #a3a3a3; text-transform: uppercase; }
+  .dl-btns { display: flex; gap: 8px; }
+  .dl-btn { display: inline-block; padding: 8px 20px; border-radius: 6px; text-decoration: none; font-size: 13px; font-weight: 600; color: #000; }
+  .dl-btn.csv { background: #ffd900; }
+  .dl-btn.json { background: #7c3aed; color: #fff; }
+  .dl-btn.xlsx { background: #2563eb; color: #fff; }
+  .dl-btn:hover { filter: brightness(0.85); }
+  .empty-state { text-align: center; padding: 60px 24px; color: #737373; font-size: 14px; }
+  .empty-state p { margin-bottom: 8px; }
+  .user-badge { color: #a3a3a3; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <a href="/"><img src="/static/logo_dark.png" alt="Auction Intel" style="height:32px;"></a>
+  <nav>
+    <a href="/">Auction Search</a>
+    <a href="/database">Database</a>
+    <a href="/wallet">Wallet</a>
+    <a href="/results" class="active">Results</a>
+    <a href="/billing">Billing</a>
+    <a href="/profile">Profile</a>
+    <span class="user-badge">{{EMAIL}}</span>
+    <a href="/logout">Logout</a>
+  </nav>
+</div>
+<div class="container">
+  <h2>Search Results</h2>
+  <p class="subtitle">Your past search results are stored for 180 days. Download in CSV, JSON, or XLSX format.</p>
+  {{JOB_CARDS}}
+</div>
+</body>
+</html>"""
+
+LANDING_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Auction Intel - Find Nonprofit Auction Events at Scale</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #000000; color: #f5f5f5; }
+  a { color: inherit; text-decoration: none; }
+
+  /* Nav */
+  .topnav { position: fixed; top: 0; width: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(12px); border-bottom: 1px solid #1a1a1a; padding: 16px 40px; display: flex; justify-content: space-between; align-items: center; z-index: 100; }
+  .topnav .logo { display: flex; align-items: center; gap: 12px; }
+  .topnav .logo img { height: 32px; }
+  .topnav .logo span { font-size: 14px; font-weight: 600; color: #a3a3a3; }
+  .topnav .nav-links { display: flex; gap: 32px; align-items: center; }
+  .topnav .nav-links a { font-size: 14px; color: #a3a3a3; transition: color 0.2s; }
+  .topnav .nav-links a:hover { color: #f5f5f5; }
+  .topnav .btn-login { padding: 8px 20px; border: 1px solid #333; border-radius: 8px; font-size: 14px; color: #f5f5f5; }
+  .topnav .btn-login:hover { border-color: #eab308; color: #eab308; }
+  .topnav .btn-cta { padding: 8px 20px; background: #ffd900; color: #000; border-radius: 8px; font-size: 14px; font-weight: 600; }
+  .topnav .btn-cta:hover { background: #eab308; }
+
+  /* Hero */
+  .hero { padding: 160px 40px 100px; text-align: center; background: radial-gradient(ellipse at 50% 0%, #1a1500 0%, #000000 70%); }
+  .hero h1 { font-size: 56px; font-weight: 800; line-height: 1.1; max-width: 800px; margin: 0 auto 24px; letter-spacing: -1px; }
+  .hero h1 .gold { color: #eab308; }
+  .hero .subtitle { font-size: 20px; color: #a3a3a3; max-width: 640px; margin: 0 auto 40px; line-height: 1.6; }
+  .hero .cta-row { display: flex; gap: 16px; justify-content: center; align-items: center; }
+  .hero .btn-primary { padding: 16px 36px; background: #ffd900; color: #000; border-radius: 10px; font-size: 17px; font-weight: 700; display: inline-block; }
+  .hero .btn-primary:hover { background: #eab308; transform: translateY(-1px); }
+  .hero .btn-secondary { padding: 16px 36px; border: 1px solid #333; border-radius: 10px; font-size: 17px; color: #d4d4d4; display: inline-block; }
+  .hero .btn-secondary:hover { border-color: #eab308; color: #eab308; }
+  .hero .trust { margin-top: 40px; font-size: 13px; color: #525252; }
+  .hero .trust span { color: #737373; }
+
+  /* Stats bar */
+  .stats-bar { display: flex; justify-content: center; gap: 60px; padding: 48px 40px; border-top: 1px solid #1a1a1a; border-bottom: 1px solid #1a1a1a; }
+  .stats-bar .stat { text-align: center; }
+  .stats-bar .stat .num { font-size: 36px; font-weight: 800; color: #eab308; }
+  .stats-bar .stat .lbl { font-size: 13px; color: #737373; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px; }
+
+  /* Sections */
+  section { padding: 100px 40px; }
+  section.alt { background: #0a0a0a; }
+  .section-header { text-align: center; max-width: 640px; margin: 0 auto 60px; }
+  .section-header .tag { display: inline-block; padding: 4px 14px; background: #1a1500; border: 1px solid #332d00; border-radius: 20px; font-size: 12px; color: #eab308; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px; }
+  .section-header h2 { font-size: 40px; font-weight: 700; margin-bottom: 16px; letter-spacing: -0.5px; }
+  .section-header p { font-size: 17px; color: #a3a3a3; line-height: 1.6; }
+
+  /* Features grid */
+  .features-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; max-width: 1100px; margin: 0 auto; }
+  .feature-card { background: #111111; border: 1px solid #1a1a1a; border-radius: 16px; padding: 32px; }
+  .feature-card:hover { border-color: #262626; }
+  .feature-card .icon { width: 48px; height: 48px; background: #1a1500; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 22px; margin-bottom: 20px; }
+  .feature-card h3 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+  .feature-card p { font-size: 14px; color: #a3a3a3; line-height: 1.6; }
+
+  /* How it works */
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 32px; max-width: 1100px; margin: 0 auto; }
+  .step { text-align: center; }
+  .step .step-num { width: 48px; height: 48px; border: 2px solid #eab308; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 800; color: #eab308; margin: 0 auto 16px; }
+  .step h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+  .step p { font-size: 14px; color: #a3a3a3; line-height: 1.5; }
+
+  /* Pricing */
+  .pricing-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; max-width: 800px; margin: 0 auto; }
+  .price-card { background: #111111; border: 1px solid #1a1a1a; border-radius: 16px; padding: 36px; }
+  .price-card.highlight { border-color: #eab308; position: relative; }
+  .price-card.highlight::before { content: "MOST POPULAR"; position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: #eab308; color: #000; font-size: 11px; font-weight: 700; padding: 4px 16px; border-radius: 20px; letter-spacing: 1px; }
+  .price-card h3 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+  .price-card .price-tag { font-size: 14px; color: #a3a3a3; margin-bottom: 20px; }
+  .price-card .price-tag b { font-size: 36px; color: #f5f5f5; font-weight: 800; }
+  .price-card ul { list-style: none; }
+  .price-card ul li { padding: 8px 0; font-size: 14px; color: #d4d4d4; border-bottom: 1px solid #1a1a1a; }
+  .price-card ul li::before { content: "\\2713"; color: #4ade80; margin-right: 10px; font-weight: 700; }
+  .price-card ul li:last-child { border-bottom: none; }
+  .price-card .signup-btn { display: block; text-align: center; margin-top: 24px; padding: 14px; background: #ffd900; color: #000; border-radius: 10px; font-size: 15px; font-weight: 700; }
+  .price-card .signup-btn:hover { background: #eab308; }
+  .price-card.std .signup-btn { background: #1a1a1a; color: #f5f5f5; border: 1px solid #333; }
+  .price-card.std .signup-btn:hover { border-color: #eab308; color: #eab308; }
+
+  /* FAQ */
+  .faq-list { max-width: 720px; margin: 0 auto; }
+  .faq-item { border-bottom: 1px solid #1a1a1a; }
+  .faq-q { padding: 20px 0; font-size: 16px; font-weight: 600; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+  .faq-q:hover { color: #eab308; }
+  .faq-q .arrow { font-size: 20px; color: #525252; transition: transform 0.2s; }
+  .faq-a { display: none; padding: 0 0 20px; font-size: 14px; color: #a3a3a3; line-height: 1.7; }
+  .faq-item.open .faq-a { display: block; }
+  .faq-item.open .arrow { transform: rotate(45deg); color: #eab308; }
+
+  /* CTA */
+  .final-cta { text-align: center; padding: 100px 40px; background: radial-gradient(ellipse at 50% 100%, #1a1500 0%, #000000 70%); }
+  .final-cta h2 { font-size: 40px; font-weight: 700; margin-bottom: 16px; }
+  .final-cta p { font-size: 17px; color: #a3a3a3; margin-bottom: 36px; max-width: 500px; margin-left: auto; margin-right: auto; }
+  .final-cta .btn-primary { padding: 16px 40px; background: #ffd900; color: #000; border-radius: 10px; font-size: 17px; font-weight: 700; display: inline-block; }
+  .final-cta .btn-primary:hover { background: #eab308; }
+
+  /* Footer */
+  .footer { padding: 40px; border-top: 1px solid #1a1a1a; text-align: center; font-size: 13px; color: #525252; }
+</style>
+</head>
+<body>
+
+<div class="topnav">
+  <div class="logo">
+    <img src="/static/logo_dark.png" alt="Auction Intel">
+  </div>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#how-it-works">How It Works</a>
+    <a href="#pricing">Pricing</a>
+    <a href="#faq">FAQ</a>
+    <a href="/login" class="btn-login">Log In</a>
+    <a href="/register" class="btn-cta">Start Free</a>
+  </div>
+</div>
+
+<!-- Hero -->
+<div class="hero">
+  <h1>Find <span class="gold">Nonprofit Auction Events</span> Before Your Competition</h1>
+  <p class="subtitle">AI-powered research that scans the entire web to find upcoming galas, silent auctions, and fundraisers. Get verified leads with event URLs, dates, contacts, and auction details in minutes, not weeks.</p>
+  <div class="cta-row">
+    <a href="/register" class="btn-primary">Get Started Free</a>
+    <a href="#how-it-works" class="btn-secondary">See How It Works</a>
+  </div>
+  <p class="trust">Powered by Google Gemini AI with real-time web grounding <span>&bull;</span> Results verified against actual event pages</p>
+</div>
+
+<!-- Stats -->
+<div class="stats-bar">
+  <div class="stat"><div class="num">276K+</div><div class="lbl">Nonprofits in Database</div></div>
+  <div class="stat"><div class="num">16</div><div class="lbl">Data Fields Per Lead</div></div>
+  <div class="stat"><div class="num">3-Phase</div><div class="lbl">AI Verification</div></div>
+  <div class="stat"><div class="num">180 Days</div><div class="lbl">Result Storage</div></div>
+</div>
+
+<!-- Features -->
+<section id="features">
+  <div class="section-header">
+    <span class="tag">Features</span>
+    <h2>Everything You Need to Win More Auction Consignments</h2>
+    <p>Stop manually Googling nonprofits one by one. Our AI research engine handles thousands of organizations in a single run and delivers verified, actionable leads.</p>
+  </div>
+  <div class="features-grid">
+    <div class="feature-card">
+      <div class="icon">&#x1F50D;</div>
+      <h3>AI-Powered Deep Research</h3>
+      <p>3-phase verification visits actual event pages, not just search snippets. Every lead includes the real event URL as proof the auction exists.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">&#x1F3E6;</div>
+      <h3>IRS Nonprofit Database</h3>
+      <p>Search 276,000+ nonprofits by state, revenue, event type, and prospect tier. Filter by gala, auction, golf, dinner, and 20+ event categories.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">&#x26A1;</div>
+      <h3>Batch Processing</h3>
+      <p>Research up to 1,000 nonprofits per search. Results stream in real-time so you can watch progress as each organization is researched.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">&#x1F4CA;</div>
+      <h3>16-Field Rich Leads</h3>
+      <p>Every lead includes event title, date, URL, auction type, confidence score, contact name, email, address, phone, and evidence text from the source page.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">&#x1F4E5;</div>
+      <h3>Export Anywhere</h3>
+      <p>Download results as CSV, JSON, or XLSX. Results are stored for 180 days so you can come back and re-download anytime.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">&#x1F6E1;</div>
+      <h3>Quality Tiers & Billing</h3>
+      <p>Only pay for verified leads. Our tiered system (Full, Partial, Semi, Bare) means you pay based on how complete each lead is. No URL, no charge.</p>
+    </div>
+  </div>
+</section>
+
+<!-- How It Works -->
+<section class="alt" id="how-it-works">
+  <div class="section-header">
+    <span class="tag">How It Works</span>
+    <h2>From Prospect List to Auction Leads in 4 Steps</h2>
+    <p>Our AI does the heavy lifting so you can focus on closing deals.</p>
+  </div>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <h3>Search the Database</h3>
+      <p>Use our IRS nonprofit database to filter 276K+ organizations by location, revenue, event type, and prospect tier.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <h3>Send to AI Research</h3>
+      <p>Select organizations and send them to the Auction Finder. Our AI scans their websites, event platforms, and the web.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <h3>3-Phase Verification</h3>
+      <p>Phase 1: Quick scan. Phase 2: Deep research with full page visits. Phase 3: Targeted follow-up for missing fields.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <h3>Download & Close</h3>
+      <p>Get verified leads with event URLs, dates, contacts, and auction details. Export as CSV/JSON/XLSX and start reaching out.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Trial Banner -->
+<section style="padding:60px 40px;text-align:center;background:linear-gradient(180deg,#1a1500 0%,#000 100%);border-bottom:1px solid #1a1a1a;">
+  <div style="max-width:600px;margin:0 auto;">
+    <div style="display:inline-block;padding:6px 20px;background:#eab30822;border:1px solid #eab30844;border-radius:24px;font-size:13px;color:#eab308;font-weight:700;margin-bottom:20px;">LIMITED TIME OFFER</div>
+    <h2 style="font-size:36px;font-weight:800;margin-bottom:12px;">Free Trial: <span style="color:#4ade80;">150 Nonprofit Searches</span> Included</h2>
+    <p style="font-size:17px;color:#a3a3a3;margin-bottom:8px;">Up to $50 in value. No credit card required.</p>
+    <p style="font-size:15px;color:#737373;margin-bottom:28px;">Use promo code <span style="background:#1a1a1a;padding:4px 12px;border-radius:6px;font-family:monospace;color:#eab308;font-weight:700;font-size:16px;border:1px solid #333;">26AUCTION26</span> at registration</p>
+    <a href="/register" style="display:inline-block;padding:16px 40px;background:#ffd900;color:#000;border-radius:10px;font-size:17px;font-weight:700;text-decoration:none;">Start Your Free Trial</a>
+    <p style="font-size:12px;color:#525252;margin-top:16px;">7-day trial. No auto-charge. Cancel anytime.</p>
+  </div>
+</section>
+
+<!-- Pricing -->
+<section id="pricing">
+  <div class="section-header">
+    <span class="tag">Pricing</span>
+    <h2>Pay Only for What You Find</h2>
+    <p>Wallet-based billing. No subscriptions, no commitments. Top up your wallet and only pay for researched nonprofits and verified leads.</p>
+  </div>
+  <div class="pricing-grid">
+    <div class="price-card std">
+      <h3>Research Fee</h3>
+      <div class="price-tag"><b>$0.08</b> / nonprofit</div>
+      <ul>
+        <li>Charged per nonprofit researched</li>
+        <li>$0.07 at 10,000+ volume</li>
+        <li>$0.06 at 50,000+ volume</li>
+        <li>Covers all 3 AI research phases</li>
+        <li>Charged whether or not a lead is found</li>
+      </ul>
+      <a href="/register" class="signup-btn">Create Account</a>
+    </div>
+    <div class="price-card highlight">
+      <h3>Lead Fees</h3>
+      <div class="price-tag">From <b>$0.50</b> / lead</div>
+      <ul>
+        <li><b>Full Lead</b> &mdash; $1.50 (all fields + URL)</li>
+        <li><b>Partial Lead</b> &mdash; $1.00 (event + contact email)</li>
+        <li><b>Semi Lead</b> &mdash; $0.75 (event + email, no auction type)</li>
+        <li><b>Bare Lead</b> &mdash; $0.50 (event + URL only)</li>
+        <li>No URL = No charge</li>
+      </ul>
+      <a href="/register" class="signup-btn">Get Started</a>
+    </div>
+  </div>
+</section>
+
+<!-- FAQ -->
+<section class="alt" id="faq">
+  <div class="section-header">
+    <span class="tag">FAQ</span>
+    <h2>Frequently Asked Questions</h2>
+  </div>
+  <div class="faq-list">
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What types of events does Auction Intel find? <span class="arrow">+</span></div>
+      <div class="faq-a">We find any nonprofit fundraising event that includes an auction component: silent auctions, live auctions, galas with paddle raises, charity dinners with auction items, golf tournaments with silent auctions, art shows, casino nights, and more. If the event has bidding, we find it.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How does the AI verify that an event actually exists? <span class="arrow">+</span></div>
+      <div class="faq-a">Our 3-phase research pipeline does not rely on search snippets alone. The AI visits the actual event page, reads the full page text, extracts evidence quotes proving the auction exists, and returns the direct URL. Every billable lead must have a verified event URL &mdash; no URL, no charge.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What if a nonprofit doesn't have an upcoming auction? <span class="arrow">+</span></div>
+      <div class="faq-a">You still pay the research fee ($0.08 per nonprofit) because the AI performed the web research. However, you are NOT charged a lead fee for nonprofits where no auction was found. The research fee covers the AI compute cost regardless of outcome.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How do I add funds to my account? <span class="arrow">+</span></div>
+      <div class="faq-a">We use Stripe for secure payments. Go to the Wallet page, enter an amount between $250 and $9,999, and complete checkout. Your balance updates instantly. All funds are non-refundable but never expire.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What's included in the IRS nonprofit database? <span class="arrow">+</span></div>
+      <div class="faq-a">Our database contains 276,000+ nonprofits extracted from IRS filings. Each record includes organization name, website, address, revenue figures, fundraising income/expenses, event names, event keywords, and prospect tier ratings. You can filter by any of these fields before sending organizations to the AI research engine.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How long are results stored? <span class="arrow">+</span></div>
+      <div class="faq-a">All search results are stored for 180 days. You can re-download CSV, JSON, or XLSX files from the Results page at any time during this period. After 180 days, results are automatically deleted.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can I research nonprofits not in the database? <span class="arrow">+</span></div>
+      <div class="faq-a">Yes. The database is just one way to build your prospect list. You can also paste nonprofit names or domain URLs directly into the Auction Search page. The AI will research any organization you give it, whether it's in our database or not.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What's the difference between lead tiers? <span class="arrow">+</span></div>
+      <div class="faq-a"><b>Full ($1.50)</b>: Event title, date, URL, auction type, contact name, and verified contact email. <b>Partial ($1.00)</b>: Event + auction type + contact email but no contact name. <b>Semi ($0.75)</b>: Event + contact email but no auction type. <b>Bare ($0.50)</b>: Event title, date, and URL only. All tiers require a verified event URL.</div>
+    </div>
+  </div>
+</section>
+
+<!-- Final CTA -->
+<div class="final-cta">
+  <h2>Ready to Find Your Next Auction Consignment?</h2>
+  <p>Join auction professionals who use Auction Intel to discover nonprofit events before the competition.</p>
+  <a href="/register" class="btn-primary">Create Your Free Account</a>
+</div>
+
+<div class="footer">
+  &copy; 2026 Auction Intel. All rights reserved.
+</div>
+
+</body>
+</html>"""
+
+# ─── Run ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    if not os.environ.get("GEMINI3PRO_API_KEY"):
+        print("ERROR: GEMINI3PRO_API_KEY environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+
+    # Initialize SQLite database
+    init_db()
+    print("Database initialized.", file=sys.stderr)
+
+    port = int(os.environ.get("PORT", 5000))
+    print(f"AUCTIONFINDER Web UI starting on http://localhost:{port}", file=sys.stderr)
+    print(f"Stripe configured: {'Yes' if stripe.api_key else 'No (set STRIPE_SECRET_KEY)'}", file=sys.stderr)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

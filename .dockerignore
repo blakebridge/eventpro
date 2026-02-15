@@ -1,0 +1,12 @@
+__pycache__/
+.env
+*.db
+*.db-shm
+*.db-wal
+.git/
+.idea/
+.claude/
+node_modules/
+results/
+nul
+=8.0.0
