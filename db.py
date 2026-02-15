@@ -91,8 +91,6 @@ def init_db():
     # Create or update admin user from env vars
     admin_email = os.environ.get("AUCTIONFINDER_ADMIN_EMAIL", "admin@auctionfinder.local").strip().lower()
     admin_password = os.environ.get("AUCTIONFINDER_PASSWORD", "admin")
-    print(f"[INIT] Admin email from env: '{admin_email}'", file=sys.stderr)
-    print(f"[INIT] Admin password length: {len(admin_password)}", file=sys.stderr)
     row = conn.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
     if not row:
         pw_hash = generate_password_hash(admin_password)
@@ -110,6 +108,12 @@ def init_db():
         pw_hash = generate_password_hash(admin_password)
         conn.execute("UPDATE users SET password_hash = ?, is_admin = 1 WHERE id = ?",
                       (pw_hash, row["id"]))
+        conn.commit()
+
+    # Ensure blake@auctionintel.us is always admin
+    blake = conn.execute("SELECT id FROM users WHERE email = ?", ("blake@auctionintel.us",)).fetchone()
+    if blake:
+        conn.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (blake["id"],))
         conn.commit()
 
 
