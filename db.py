@@ -116,9 +116,48 @@ def init_db():
     """)
     conn.commit()
 
-    # Create or update admin user from env vars
+    # ── Cleanup: deduplicate users (keep oldest account per email) ──
+    dupes = conn.execute(
+        "SELECT email, MIN(id) as keep_id, COUNT(*) as cnt FROM users GROUP BY email HAVING cnt > 1"
+    ).fetchall()
+    for d in dupes:
+        email, keep_id, cnt = d["email"], d["keep_id"], d["cnt"]
+        print(f"[DB CLEANUP] Removing {cnt - 1} duplicate(s) for {email} (keeping id={keep_id})")
+        # Move any wallet balance from dupes to the keeper
+        conn.execute(
+            "UPDATE wallets SET balance_cents = balance_cents + COALESCE("
+            "(SELECT SUM(w2.balance_cents) FROM wallets w2 JOIN users u ON w2.user_id = u.id "
+            "WHERE u.email = ? AND u.id != ?), 0) WHERE user_id = ?",
+            (email, keep_id, keep_id),
+        )
+        # Delete duplicate wallets, transactions, then users
+        conn.execute("DELETE FROM wallets WHERE user_id IN (SELECT id FROM users WHERE email = ? AND id != ?)", (email, keep_id))
+        conn.execute("DELETE FROM transactions WHERE user_id IN (SELECT id FROM users WHERE email = ? AND id != ?)", (email, keep_id))
+        conn.execute("DELETE FROM users WHERE email = ? AND id != ?", (email, keep_id))
+    if dupes:
+        conn.commit()
+        print(f"[DB CLEANUP] Deduplicated {len(dupes)} email(s)")
+
+    # Ensure UNIQUE index on email (for DBs created before the constraint was added)
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        conn.commit()
+    except Exception:
+        pass  # Already enforced by table definition
+
+    # Remove stale fallback admin account if real admin is configured
     admin_email = os.environ.get("AUCTIONFINDER_ADMIN_EMAIL", "").strip().lower()
     admin_password = os.environ.get("AUCTIONFINDER_PASSWORD", "")
+    if admin_email and admin_email != "admin@auctionfinder.local":
+        stale = conn.execute("SELECT id FROM users WHERE email = 'admin@auctionfinder.local'").fetchone()
+        if stale:
+            conn.execute("DELETE FROM wallets WHERE user_id = ?", (stale["id"],))
+            conn.execute("DELETE FROM transactions WHERE user_id = ?", (stale["id"],))
+            conn.execute("DELETE FROM users WHERE id = ?", (stale["id"],))
+            conn.commit()
+            print(f"[DB CLEANUP] Removed stale admin@auctionfinder.local account")
+
+    # Create or update admin user from env vars
     print(f"[ADMIN INIT] email env={'set' if admin_email else 'MISSING'} -> '{admin_email}'")
     print(f"[ADMIN INIT] password env={'set' if admin_password else 'MISSING'} (len={len(admin_password)})")
     if not admin_email or not admin_password:

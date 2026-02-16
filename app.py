@@ -23,6 +23,7 @@ import sys
 import time
 import threading
 import queue
+import datetime as _dt
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from functools import wraps
@@ -72,6 +73,11 @@ from html import escape as html_escape
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+app.permanent_session_lifetime = _dt.timedelta(days=30)
+
+@app.before_request
+def _make_session_permanent():
+    session.permanent = True
 
 RESULTS_DIR = os.environ.get("RESULTS_DIR", "results")
 DB_CONN_STRING = os.environ.get(
@@ -141,7 +147,7 @@ def _inject_nav_badge(html: str) -> str:
 _SIDEBAR_CSS = """
   .sidebar { position:fixed; top:0; left:0; width:260px; height:100vh; background:#0a0a0a; border-right:1px solid #1a1a1a; display:flex; flex-direction:column; z-index:100; overflow-y:auto; transition:transform 0.3s ease; }
   .sidebar-logo { padding:20px 24px; border-bottom:1px solid #1a1a1a; }
-  .sidebar-logo img { height:28px; }
+  .sidebar-logo img { height:44px; }
   .sidebar-section { padding:16px 12px 4px; }
   .sidebar-label { font-size:10px; color:#525252; text-transform:uppercase; letter-spacing:1px; padding:0 12px; margin-bottom:4px; font-weight:600; }
   .sidebar-nav { display:flex; flex-direction:column; }
@@ -219,7 +225,7 @@ def _build_sidebar_html(active):
     return (
         '<div class="sidebar-overlay" id="sidebarOverlay" onclick="document.getElementById(\'sidebar\').classList.remove(\'open\');this.classList.remove(\'open\');"></div>\n'
         '<aside class="sidebar" id="sidebar">\n'
-        '  <div class="sidebar-logo"><a href="/"><img src="/static/logo_dark.png" alt="Auction Intel" style="height:28px;"></a></div>\n'
+        '  <div class="sidebar-logo"><a href="/"><img src="/static/logo_dark.png" alt="Auction Intel" style="height:44px;"></a></div>\n'
         f'{sections}'
         '  <div class="sidebar-bottom">\n'
         f'    <a href="/logout">{_SIDEBAR_ICONS["logout"]} Logout</a>\n'
@@ -2921,7 +2927,7 @@ LANDING_HTML = """<!DOCTYPE html>
   /* Nav */
   .topnav { position: fixed; top: 0; width: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(12px); border-bottom: 1px solid #1a1a1a; padding: 16px 40px; display: flex; justify-content: space-between; align-items: center; z-index: 100; }
   .topnav .logo { display: flex; align-items: center; gap: 12px; }
-  .topnav .logo img { height: 32px; }
+  .topnav .logo img { height: 48px; }
   .topnav .logo span { font-size: 14px; font-weight: 600; color: #a3a3a3; }
   .topnav .nav-links { display: flex; gap: 32px; align-items: center; }
   .topnav .nav-links a { font-size: 14px; color: #a3a3a3; transition: color 0.2s; }
