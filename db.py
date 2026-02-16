@@ -117,26 +117,32 @@ def init_db():
     conn.commit()
 
     # Create or update admin user from env vars
-    admin_email = os.environ.get("AUCTIONFINDER_ADMIN_EMAIL", "admin@auctionfinder.local").strip().lower()
-    admin_password = os.environ.get("AUCTIONFINDER_PASSWORD", "admin")
-    row = conn.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
-    if not row:
-        pw_hash = generate_password_hash(admin_password)
-        cur = conn.execute(
-            "INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, 1)",
-            (admin_email, pw_hash),
-        )
-        conn.execute(
-            "INSERT INTO wallets (user_id, balance_cents) VALUES (?, 0)",
-            (cur.lastrowid,),
-        )
-        conn.commit()
+    admin_email = os.environ.get("AUCTIONFINDER_ADMIN_EMAIL", "").strip().lower()
+    admin_password = os.environ.get("AUCTIONFINDER_PASSWORD", "")
+    print(f"[ADMIN INIT] email env={'set' if admin_email else 'MISSING'} -> '{admin_email}'")
+    print(f"[ADMIN INIT] password env={'set' if admin_password else 'MISSING'} (len={len(admin_password)})")
+    if not admin_email or not admin_password:
+        print("[ADMIN INIT] WARNING: AUCTIONFINDER_ADMIN_EMAIL or AUCTIONFINDER_PASSWORD not set, skipping admin creation")
     else:
-        # Update password and ensure admin flag on every startup
-        pw_hash = generate_password_hash(admin_password)
-        conn.execute("UPDATE users SET password_hash = ?, is_admin = 1 WHERE id = ?",
-                      (pw_hash, row["id"]))
-        conn.commit()
+        row = conn.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
+        if not row:
+            pw_hash = generate_password_hash(admin_password)
+            cur = conn.execute(
+                "INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, 1)",
+                (admin_email, pw_hash),
+            )
+            conn.execute(
+                "INSERT INTO wallets (user_id, balance_cents) VALUES (?, 0)",
+                (cur.lastrowid,),
+            )
+            conn.commit()
+            print(f"[ADMIN INIT] Created admin user: {admin_email} (id={cur.lastrowid})")
+        else:
+            pw_hash = generate_password_hash(admin_password)
+            conn.execute("UPDATE users SET password_hash = ?, is_admin = 1 WHERE id = ?",
+                          (pw_hash, row["id"]))
+            conn.commit()
+            print(f"[ADMIN INIT] Updated admin user: {admin_email} (id={row['id']})")
 
     # Ensure blake@auctionintel.us is always admin
     blake = conn.execute("SELECT id FROM users WHERE email = ?", ("blake@auctionintel.us",)).fetchone()
