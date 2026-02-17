@@ -113,6 +113,16 @@ def init_db():
             read_by_admin INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS exclusive_leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER REFERENCES users(id),
+            job_id TEXT NOT NULL,
+            nonprofit_name TEXT NOT NULL,
+            event_title TEXT NOT NULL,
+            event_url TEXT NOT NULL,
+            purchased_at TEXT DEFAULT (datetime('now'))
+        );
     """)
     conn.commit()
 
@@ -665,3 +675,64 @@ def get_unread_ticket_count(user_id: int, is_admin: bool = False) -> int:
             (user_id,),
         ).fetchone()
     return row[0] if row else 0
+
+
+# ─── Exclusive Leads ──────────────────────────────────────────────────────────
+
+EXCLUSIVE_LEAD_PRICE_CENTS = 250  # $2.50 flat
+
+
+def purchase_exclusive_lead(user_id: int, job_id: str, nonprofit_name: str,
+                            event_title: str, event_url: str) -> bool:
+    """Purchase exclusivity for a specific event lead. Returns True on success."""
+    conn = _get_conn()
+    # Check if already exclusive
+    existing = conn.execute(
+        "SELECT id FROM exclusive_leads WHERE event_url = ? AND event_title = ?",
+        (event_url, event_title),
+    ).fetchone()
+    if existing:
+        return False  # Already purchased by someone
+
+    # Check balance
+    bal = conn.execute("SELECT balance_cents FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
+    if not bal or bal["balance_cents"] < EXCLUSIVE_LEAD_PRICE_CENTS:
+        return False
+
+    # Charge wallet
+    conn.execute("UPDATE wallets SET balance_cents = balance_cents - ? WHERE user_id = ?",
+                 (EXCLUSIVE_LEAD_PRICE_CENTS, user_id))
+    conn.execute(
+        "INSERT INTO transactions (user_id, type, amount_cents, description, job_id) "
+        "VALUES (?, 'exclusive_lead', ?, ?, ?)",
+        (user_id, -EXCLUSIVE_LEAD_PRICE_CENTS,
+         f"Exclusive lead: {event_title[:60]} ({nonprofit_name[:40]})", job_id),
+    )
+    # Record exclusivity
+    conn.execute(
+        "INSERT INTO exclusive_leads (user_id, job_id, nonprofit_name, event_title, event_url) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, job_id, nonprofit_name, event_title, event_url),
+    )
+    conn.commit()
+    return True
+
+
+def is_lead_exclusive(event_url: str, event_title: str) -> Optional[int]:
+    """Check if an event lead is exclusive. Returns owner user_id or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT user_id FROM exclusive_leads WHERE event_url = ? AND event_title = ?",
+        (event_url, event_title),
+    ).fetchone()
+    return row["user_id"] if row else None
+
+
+def get_user_exclusive_leads(user_id: int) -> list:
+    """Get all exclusive leads for a user."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM exclusive_leads WHERE user_id = ? ORDER BY purchased_at DESC",
+        (user_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]

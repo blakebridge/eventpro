@@ -65,6 +65,8 @@ from db import (
     get_ticket_messages, add_ticket_message, update_ticket_status,
     mark_messages_read_by_user, mark_messages_read_by_admin,
     get_unread_ticket_count,
+    purchase_exclusive_lead, is_lead_exclusive, get_user_exclusive_leads,
+    EXCLUSIVE_LEAD_PRICE_CENTS,
 )
 import emails
 from html import escape as html_escape
@@ -316,6 +318,7 @@ async def _research_nonprofit_web(
                         "type": "result", "index": index, "total": total,
                         "nonprofit": nonprofit, "status": "found",
                         "event_title": scan.get("event_title", ""),
+                        "event_url": full_from_scan.get("event_url", ""),
                         "confidence": scan.get("confidence", 0),
                         "tier": tier, "tier_price": price,
                     })
@@ -393,7 +396,8 @@ async def _research_nonprofit_web(
             progress_q.put({
                 "type": "result", "index": index, "total": total,
                 "nonprofit": nonprofit, "status": status,
-                "event_title": title if is_admin else "",
+                "event_title": result.get("event_title", title) if is_admin else result.get("event_title", ""),
+                "event_url": result.get("event_url", ""),
                 "confidence": result.get("confidence_score", 0),
                 "tier": tier, "tier_price": price,
             })
@@ -430,6 +434,7 @@ async def _research_nonprofit_web(
 async def _run_job(
     nonprofits: List[str], job_id: str, progress_q: queue.Queue,
     user_id: Optional[int] = None, is_admin: bool = False, is_trial: bool = False,
+    complete_only: bool = False,
 ):
     """Run the full research pipeline for a web job."""
     if len(nonprofits) > MAX_NONPROFITS:
@@ -505,6 +510,24 @@ async def _run_job(
         save_results = all_results
     else:
         save_results = [r for r in all_results if classify_lead_tier(r)[1] > 0]
+
+    # If complete_only mode, further filter to only "full" tier leads
+    if complete_only and not is_admin:
+        save_results = [r for r in save_results if classify_lead_tier(r)[0] == "full"]
+        # Recalculate billing to only include full-tier leads
+        tier_counts = {}
+        for r in save_results:
+            tier, price = classify_lead_tier(r)
+            if price > 0:
+                if tier not in tier_counts:
+                    tier_counts[tier] = {"count": 0, "price_each": price, "total": 0}
+                tier_counts[tier]["count"] += 1
+                tier_counts[tier]["total"] += price
+        billing_summary["lead_fees"] = tier_counts
+        billing_summary["total_charged"] = (
+            billing_summary["research_fees"]
+            + sum(t["total"] for t in tier_counts.values())
+        )
 
     # Save results
     csv_file = os.path.join(RESULTS_DIR, f"{job_id}.csv")
@@ -593,13 +616,14 @@ async def _run_job(
 def _job_worker(
     nonprofits: List[str], job_id: str, progress_q: queue.Queue,
     user_id: Optional[int] = None, is_admin: bool = False, is_trial: bool = False,
+    complete_only: bool = False,
 ):
     """Thread target that runs the async job."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(
-            _run_job(nonprofits, job_id, progress_q, user_id=user_id, is_admin=is_admin, is_trial=is_trial)
+            _run_job(nonprofits, job_id, progress_q, user_id=user_id, is_admin=is_admin, is_trial=is_trial, complete_only=complete_only)
         )
     except Exception as e:
         progress_q.put({"type": "error", "message": str(e)})
@@ -1019,6 +1043,7 @@ def index():
 def start_search():
     data = request.get_json()
     raw_input = data.get("nonprofits", "")
+    complete_only = bool(data.get("complete_only", False))
     nonprofits = parse_input(raw_input)
 
     if not nonprofits:
@@ -1068,7 +1093,7 @@ def start_search():
     thread = threading.Thread(
         target=_job_worker,
         args=(nonprofits, job_id, progress_q),
-        kwargs={"user_id": user_id, "is_admin": is_admin, "is_trial": is_trial},
+        kwargs={"user_id": user_id, "is_admin": is_admin, "is_trial": is_trial, "complete_only": complete_only},
         daemon=True,
     )
     thread.start()
@@ -1124,6 +1149,45 @@ def view_results(job_id):
     if job_id not in jobs or jobs[job_id]["status"] != "complete":
         return jsonify({"error": "Job not found or not complete"}), 404
     return jsonify(jobs[job_id]["results"])
+
+
+# ─── Exclusive Leads ─────────────────────────────────────────────────────────
+
+@app.route("/api/exclusive", methods=["POST"])
+@login_required
+def make_exclusive():
+    data = request.get_json()
+    job_id = data.get("job_id", "")
+    nonprofit_name = data.get("nonprofit_name", "")
+    event_title = data.get("event_title", "")
+    event_url = data.get("event_url", "")
+
+    if not event_url or not event_title:
+        return jsonify({"error": "Missing event details"}), 400
+
+    user_id = session["user_id"]
+
+    # Check if already exclusive
+    owner = is_lead_exclusive(event_url, event_title)
+    if owner:
+        if owner == user_id:
+            return jsonify({"error": "You already own this exclusive lead"}), 409
+        return jsonify({"error": "This event lead is already exclusive"}), 409
+
+    # Check balance
+    balance = get_balance(user_id)
+    if balance < EXCLUSIVE_LEAD_PRICE_CENTS:
+        return jsonify({"error": f"Insufficient balance. Need ${EXCLUSIVE_LEAD_PRICE_CENTS/100:.2f}, have ${balance/100:.2f}."}), 402
+
+    success = purchase_exclusive_lead(user_id, job_id, nonprofit_name, event_title, event_url)
+    if not success:
+        return jsonify({"error": "Failed to purchase exclusive lead"}), 500
+
+    return jsonify({
+        "success": True,
+        "message": "This event lead has been marked exclusive and will not be included in any future search results sold to other customers.",
+        "balance": get_balance(user_id),
+    })
 
 
 # ─── IRS Database Search ─────────────────────────────────────────────────────
@@ -1937,6 +2001,13 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="input-section">
     <h2>Enter Nonprofit Domains or Names</h2>
     <textarea id="input" placeholder="Paste nonprofit domains or names here, one per line or comma-separated...&#10;&#10;Example:&#10;National Museum of Mexican Art&#10;Radio Milwaukee&#10;driveagainstdiabetes.org"></textarea>
+    <div class="toggle-row" style="margin:12px 0;display:flex;align-items:center;gap:10px;">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:#d4d4d4;" title="When enabled, only Complete Contact leads are returned — each includes event title, event date, verified event page link, auction type, contact name, and contact email.">
+        <input type="checkbox" id="completeOnly" style="accent-color:#eab308;width:16px;height:16px;">
+        <span style="font-weight:600;">Complete Contacts Only</span>
+      </label>
+      <span style="font-size:12px;color:#737373;">Fewer results, but every lead includes a contact name and email.</span>
+    </div>
     <div class="controls">
       <button class="btn-primary" id="searchBtn" onclick="startSearch()">Search for Auctions</button>
       <button class="btn-secondary" onclick="document.getElementById('input').value='';updateCount()">Clear</button>
@@ -2082,7 +2153,7 @@ async function startSearch() {
     const res = await fetch('/api/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nonprofits: raw }),
+      body: JSON.stringify({ nonprofits: raw, complete_only: document.getElementById('completeOnly').checked }),
     });
 
     if (!res.ok) {
@@ -2133,6 +2204,20 @@ async function startSearch() {
           if (data.tier && data.tier !== 'not_billable') msg += ' [' + data.tier + ']';
 
           log(msg, status);
+
+          // Add Make Exclusive button for billable leads
+          if (!IS_ADMIN && data.tier && data.tier !== 'not_billable' && data.event_url && data.event_title) {
+            const btnRow = document.createElement('div');
+            btnRow.style.cssText = 'margin:-4px 0 6px 48px;';
+            const eBtn = document.createElement('button');
+            eBtn.textContent = 'Make Exclusive';
+            eBtn.title = 'Remove this event lead from future sales to other customers — $2.50';
+            eBtn.style.cssText = 'background:#1a1500;color:#eab308;border:1px solid #332d00;border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;font-family:inherit;';
+            eBtn.onclick = function() { makeExclusive(eBtn, data.nonprofit, data.event_title, data.event_url); };
+            btnRow.appendChild(eBtn);
+            terminal.appendChild(btnRow);
+          }
+
           updateStats();
           updateProgress();
           break;
@@ -2235,6 +2320,39 @@ async function toggleJsonViewer() {
     content.innerHTML = syntaxHighlight(JSON.stringify(data, null, 2));
   } catch (err) {
     content.textContent = 'Failed to load results: ' + err.message;
+  }
+}
+
+async function makeExclusive(btn, nonprofit, title, url) {
+  if (!confirm('Make this event lead exclusive for $2.50? It will be removed from future sales to other customers.\\n\\nExclusivity applies to this specific event lead (not the entire organization).')) return;
+  btn.disabled = true;
+  btn.textContent = 'Processing...';
+  try {
+    const res = await fetch('/api/exclusive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: currentJobId, nonprofit_name: nonprofit, event_title: title, event_url: url }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      btn.textContent = 'Exclusive';
+      btn.style.background = '#4ade80';
+      btn.style.color = '#000';
+      btn.style.cursor = 'default';
+      if (data.balance !== undefined) {
+        balanceCents = data.balance;
+        balDisplay.textContent = '$' + (balanceCents / 100).toFixed(2);
+      }
+      log('Exclusive lead purchased: ' + title, 'info');
+    } else {
+      alert(data.error || 'Failed to purchase exclusive lead');
+      btn.disabled = false;
+      btn.textContent = 'Make Exclusive';
+    }
+  } catch (err) {
+    alert('Request failed: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Make Exclusive';
   }
 }
 </script>
@@ -3245,6 +3363,19 @@ LANDING_HTML = """<!DOCTYPE html>
   <p class="pricing-note"><strong>No event page link = no lead charge.</strong></p>
   <p class="pricing-note" style="margin-top:12px;">Research fee: <strong>$0.08</strong>/nonprofit ($0.07 at 10K+, $0.06 at 50K+) &mdash; charged whether or not a lead is found.</p>
   <p class="pricing-bonus">Bonus fields (no extra charge): mailing address + main phone (when available).</p>
+
+  <!-- Complete Contacts Only callout -->
+  <div style="max-width:900px;margin:40px auto 0;background:#111;border:1px solid #1a1a1a;border-radius:16px;padding:32px;text-align:left;">
+    <h3 style="font-size:20px;font-weight:700;margin-bottom:8px;">Only Want Contact-Ready Leads?</h3>
+    <p style="font-size:15px;color:#a3a3a3;line-height:1.6;">Turn on <strong style="color:#eab308;">"Complete Contacts Only"</strong> before running a search. When enabled, your results will only include leads with a verified contact name, contact email, auction type, and event page link&mdash;everything you need to reach out immediately. You'll get fewer leads per search, but every one of them is ready to use.</p>
+  </div>
+
+  <!-- Exclusive Event Lead callout -->
+  <div style="max-width:900px;margin:24px auto 0;background:#111;border:1px solid #332d00;border-radius:16px;padding:32px;text-align:left;">
+    <h3 style="font-size:20px;font-weight:700;margin-bottom:8px;">Exclusive Event Lead &mdash; <span style="color:#eab308;">$2.50</span></h3>
+    <p style="font-size:15px;color:#a3a3a3;line-height:1.6;">Want to be the only one with a specific lead? Mark any event lead as exclusive for $2.50 and it will be permanently removed from future sales to other customers. This is the total price&mdash;it replaces the standard lead tier fee. Available on any billable lead tier.</p>
+    <p style="font-size:13px;color:#737373;margin-top:12px;">Exclusivity applies to the specific event lead purchased (not the entire organization).</p>
+  </div>
 </section>
 
 <!-- FAQ -->
@@ -3289,6 +3420,14 @@ LANDING_HTML = """<!DOCTYPE html>
     <div class="faq-item">
       <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Is mailing address included? <span class="arrow">+</span></div>
       <div class="faq-a">Mailing address is included when available (no extra charge). Some nonprofits use PO Boxes or have incomplete public address data.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What is "Complete Contacts Only" mode? <span class="arrow">+</span></div>
+      <div class="faq-a">It's a toggle you can enable before running a search. When turned on, only Complete Contact leads are included in your results&mdash;each one includes event title, event date, verified event page link, auction type, contact name, and contact email. You'll get fewer results, but every lead is contact-ready. Leads that don't meet this standard are excluded from your export and not billed.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What is an Exclusive Event Lead? <span class="arrow">+</span></div>
+      <div class="faq-a">For $2.50 per lead, you can mark any event lead as exclusive. Once purchased, that specific event lead is permanently removed from future sales to other customers. This is a flat fee that replaces the standard lead tier price. Exclusivity applies to the specific event lead (not the entire organization).</div>
     </div>
   </div>
 </section>
