@@ -3204,7 +3204,7 @@ LANDING_HTML = """<!DOCTYPE html>
 <!-- Hero -->
 <div class="hero">
   <h1>Find <span class="gold">nonprofit auction events.</span> Verified. Exportable. Ready to contact.</h1>
-  <p class="subtitle">Auction Finder scans the web to find upcoming galas, banquets, benefits, golf outings, and balls that feature a live auction, silent auction, or both. Get verified leads with a verified event page link, the upcoming event date, event-level contacts (email/phone when available) plus organization mailing address when available, the auction type, and more.</p>
+  <p class="subtitle">Auction Intel's new Auction Finder Research Engine scans nonprofit websites to find upcoming fundraising events with a live auction, a silent auction, or both. Get high-quality leads with a verified event page link, the event date, event-level contacts (email/phone), the auction type, and more.</p>
   <div class="cta-row">
     <a href="/register" class="btn-primary">Get Started Free</a>
     <a href="#how-it-works" class="btn-secondary">See How It Works</a>
