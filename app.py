@@ -16,6 +16,7 @@ Usage:
 import asyncio
 import csv
 import io
+import hashlib
 import json
 import os
 import secrets
@@ -74,7 +75,13 @@ from html import escape as html_escape
 # ─── App Configuration ───────────────────────────────────────────────────────
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+# Stable secret key: use FLASK_SECRET_KEY env var, or derive from admin password so
+# sessions survive Railway redeploys (no more random key = no more logout on every deploy)
+_stable_seed = os.environ.get("AUCTIONFINDER_PASSWORD", "")
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or (
+    hashlib.sha256(f"auctionfinder-session::{_stable_seed}".encode()).hexdigest()
+    if _stable_seed else secrets.token_hex(32)
+)
 app.permanent_session_lifetime = _dt.timedelta(days=30)
 
 @app.before_request
