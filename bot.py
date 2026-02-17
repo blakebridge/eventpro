@@ -59,7 +59,6 @@ ALLOWLISTED_PLATFORMS = [
 CSV_COLUMNS = [
     "nonprofit_name",
     "event_title",
-    "event_type",
     "evidence_date",
     "auction_type",
     "event_date",
@@ -150,7 +149,6 @@ You MUST respond with ONLY valid JSON (no markdown fences, no extra text) in thi
 {
   "nonprofit_name": "Full Organization Name",
   "event_title": "Full Event Title",
-  "event_type": "gala or fundraiser",
   "evidence_date": "Raw text snippet from the website proving the date",
   "auction_type": "silent, live, or Live and Silent",
   "event_date": "MM/DD/YYYY",
@@ -169,20 +167,20 @@ You MUST respond with ONLY valid JSON (no markdown fences, no extra text) in thi
 
 ## Few-Shot Examples
 
-### Example 1 (gala with live and silent auction):
+### Example 1 (live and silent auction):
 Input: "National Museum of Mexican Art"
 Output:
-{"nonprofit_name": "National Museum of Mexican Art", "event_title": "Gala de Arte: Agua Sagrada", "event_type": "gala", "evidence_date": "Gala de Arte:  Agua Sagrada\\n\\nMay 1, 2026, 6:00 11:00 pm Aon Grand Ballroom at Navy Pier", "auction_type": "Live and Silent", "event_date": "5/1/2026", "event_url": "https://nationalmuseumofmexicanart.org/events/galadearte", "confidence_score": 0.98, "evidence_auction": "The Gala de Arte promises an unforgettable evening. In addition to networking with fellow supporters, youll enjoy a silent auction, live auction, exquisite cuisine, live music, and dancing.", "contact_name": "Barbara Engelskirchen", "contact_email": "barbara@nationalmuseumofmexicanart.org", "contact_role": "sponsorship", "organization_address": "1852 W 19th Street, Chicago, IL 60608", "organization_phone_maps": "(312) 738-1503", "contact_source_url": "https://nationalmuseumofmexicanart.org/events/galadearte", "event_summary": "The National Museum of Mexican Arts official Events page lists \\"Gala de Arte: Agua Sagrada\\" on May 1, 2026 at the Aon Grand Ballroom at Navy Pier in Chicago. The event description clearly states that attendees will enjoy a silent auction and live auction, confirming a 2026 gala auction on the official domain.", "status": "found"}
+{"nonprofit_name": "National Museum of Mexican Art", "event_title": "Gala de Arte: Agua Sagrada", "evidence_date": "Gala de Arte:  Agua Sagrada\\n\\nMay 1, 2026, 6:00 11:00 pm Aon Grand Ballroom at Navy Pier", "auction_type": "Live and Silent", "event_date": "5/1/2026", "event_url": "https://nationalmuseumofmexicanart.org/events/galadearte", "confidence_score": 0.98, "evidence_auction": "The Gala de Arte promises an unforgettable evening. In addition to networking with fellow supporters, youll enjoy a silent auction, live auction, exquisite cuisine, live music, and dancing.", "contact_name": "Barbara Engelskirchen", "contact_email": "barbara@nationalmuseumofmexicanart.org", "contact_role": "sponsorship", "organization_address": "1852 W 19th Street, Chicago, IL 60608", "organization_phone_maps": "(312) 738-1503", "contact_source_url": "https://nationalmuseumofmexicanart.org/events/galadearte", "event_summary": "The National Museum of Mexican Arts official Events page lists \\"Gala de Arte: Agua Sagrada\\" on May 1, 2026 at the Aon Grand Ballroom at Navy Pier in Chicago. The event description clearly states that attendees will enjoy a silent auction and live auction, confirming a 2026 gala auction on the official domain.", "status": "found"}
 
-### Example 2 (fundraiser with silent auction):
+### Example 2 (silent auction):
 Input: "Radio Milwaukee"
 Output:
-{"nonprofit_name": "Radio Milwaukee", "event_title": "SoundBites 2026 from Radio Milwaukee", "event_type": "fundraiser", "evidence_date": "06:00 PM - 10:00 PM on Thu, 5 Mar 2026", "auction_type": "silent", "event_date": "3/5/2026", "event_url": "https://radiomilwaukee.org/community-calendar/event/soundbites-16-01-2025-10-34-53", "confidence_score": 0.96, "evidence_auction": "General admission\\n\\u2022 Snacks and treats ...\\n\\u2022 Premium whiskey tasting ...\\n\\u2022 Silent auction with items ranging from arts and entertainment to food and beverages\\n\\u2022 Gift-card pull from local restaurants", "contact_name": "Jeremy Zuleger", "contact_email": "jeremy@radiomilwaukee.org", "contact_role": "sponsorship", "organization_address": "220 E Pittsburgh Ave, Milwaukee, WI 53204", "organization_phone_maps": "414-892-8900", "contact_source_url": "https://radiomilwaukee.org/community-calendar/event/soundbites-16-01-2025-10-34-53", "event_summary": "Radio Milwaukees official site lists SoundBites 2026, its signature fundraising soir\\u00e9e at the Harley-Davidson Museum on Thursday, March 5, 2026. The event description explicitly includes a silent auction with items and states that all proceeds benefit Radio Milwaukee, making it a confirmed upcoming auction fundraiser.", "status": "found"}
+{"nonprofit_name": "Radio Milwaukee", "event_title": "SoundBites 2026 from Radio Milwaukee", "evidence_date": "06:00 PM - 10:00 PM on Thu, 5 Mar 2026", "auction_type": "silent", "event_date": "3/5/2026", "event_url": "https://radiomilwaukee.org/community-calendar/event/soundbites-16-01-2025-10-34-53", "confidence_score": 0.96, "evidence_auction": "General admission\\n\\u2022 Snacks and treats ...\\n\\u2022 Premium whiskey tasting ...\\n\\u2022 Silent auction with items ranging from arts and entertainment to food and beverages\\n\\u2022 Gift-card pull from local restaurants", "contact_name": "Jeremy Zuleger", "contact_email": "jeremy@radiomilwaukee.org", "contact_role": "sponsorship", "organization_address": "220 E Pittsburgh Ave, Milwaukee, WI 53204", "organization_phone_maps": "414-892-8900", "contact_source_url": "https://radiomilwaukee.org/community-calendar/event/soundbites-16-01-2025-10-34-53", "event_summary": "Radio Milwaukees official site lists SoundBites 2026, its signature fundraising soir\\u00e9e at the Harley-Davidson Museum on Thursday, March 5, 2026. The event description explicitly includes a silent auction with items and states that all proceeds benefit Radio Milwaukee, making it a confirmed upcoming auction fundraiser.", "status": "found"}
 
 ### Example 3 (not found — use this format when no auction event is found):
 Input: "Some Unknown Nonprofit"
 Output:
-{"nonprofit_name": "Some Unknown Nonprofit", "event_title": "", "event_type": "", "evidence_date": "", "auction_type": "", "event_date": "", "event_url": "", "confidence_score": 0.0, "evidence_auction": "", "contact_name": "", "contact_email": "", "contact_role": "", "organization_address": "", "organization_phone_maps": "", "contact_source_url": "", "event_summary": "No upcoming auction events found after searching the official domain, third-party platforms, and general web search.", "status": "not_found"}
+{"nonprofit_name": "Some Unknown Nonprofit", "event_title": "", "evidence_date": "", "auction_type": "", "event_date": "", "event_url": "", "confidence_score": 0.0, "evidence_auction": "", "contact_name": "", "contact_email": "", "contact_role": "", "organization_address": "", "organization_phone_maps": "", "contact_source_url": "", "event_summary": "No upcoming auction events found after searching the official domain, third-party platforms, and general web search.", "status": "not_found"}
 
 ## CRITICAL RULES
 - Return ONLY the JSON object, no markdown code fences, no explanation before or after
