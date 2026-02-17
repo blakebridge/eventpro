@@ -86,6 +86,9 @@ DB_CONN_STRING = os.environ.get(
     "IRS_DB_CONNECTION",
     "postgresql://localhost/irs"
 )
+_masked = DB_CONN_STRING[:25] + "..." if len(DB_CONN_STRING) > 25 else DB_CONN_STRING
+print(f"[IRS DB] Connection string: {_masked}")
+print(f"[IRS DB] IRS_DB_CONNECTION env set: {'yes' if os.environ.get('IRS_DB_CONNECTION') else 'NO — using fallback'}")
 
 # Stripe config
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
