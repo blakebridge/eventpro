@@ -463,8 +463,9 @@ async def research_nonprofit(
             if scan.get("has_event") and scan.get("confidence", 0) >= 0.85:
                 full_from_scan = _quick_scan_to_full(scan, nonprofit)
                 tier, _ = classify_lead_tier(full_from_scan)
-                # Only stop at Phase 1 if tier is "full" AND we have a real URL
-                if tier == "full" and _has_valid_url(full_from_scan):
+                has_source_url = bool(full_from_scan.get("contact_source_url", "").strip())
+                # Only stop at Phase 1 if tier is "full", we have a real URL, AND contact_source_url
+                if tier == "full" and _has_valid_url(full_from_scan) and has_source_url:
                     print(f"  [{index}/{total}] FOUND (quick-full): {nonprofit} -> {scan.get('event_title', '')}", file=sys.stderr)
                     full_from_scan["_api_calls"] = api_calls
                     full_from_scan["_phase"] = "quick_scan"
