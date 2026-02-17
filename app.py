@@ -331,12 +331,25 @@ async def _research_nonprofit_web(
     job_id: str = "",
     is_admin: bool = False,
     is_trial: bool = False,
+    balance_stop: Optional[asyncio.Event] = None,
 ) -> Dict[str, Any]:
     """Research a single nonprofit using 3-phase early-stop strategy.
     Pushes progress events to the queue. Charges fees for non-admin users.
     Trial users are only charged for billable results (no research fee on dead leads).
+    balance_stop: if set, the job has been stopped due to insufficient balance.
     """
     async with semaphore:
+        # Skip if balance already exhausted by another nonprofit in this batch
+        if balance_stop and balance_stop.is_set():
+            result = _error_result(nonprofit, "Skipped — insufficient balance")
+            result["_balance_skipped"] = True
+            progress_q.put({
+                "type": "result", "index": index, "total": total,
+                "nonprofit": nonprofit, "status": "error",
+                "event_title": "Skipped — insufficient balance", "confidence": 0,
+                "tier": "not_billable", "tier_price": 0,
+            })
+            return result
         progress_q.put({"type": "processing", "index": index, "total": total, "nonprofit": nonprofit})
         api_calls = 0
         text = ""
@@ -357,8 +370,13 @@ async def _research_nonprofit_web(
                 # Charge research fee (trial users: free on dead leads)
                 if user_id and not is_admin and not is_trial:
                     fee = get_research_fee_cents(total)
-                    charge_research_fee(user_id, 1, job_id, fee)
-                    progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                    if get_balance(user_id) >= fee:
+                        charge_research_fee(user_id, 1, job_id, fee)
+                        progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                    else:
+                        if balance_stop:
+                            balance_stop.set()
+                        progress_q.put({"type": "balance_warning", "message": "Insufficient balance — stopping job."})
 
                 progress_q.put({
                     "type": "result", "index": index, "total": total,
@@ -367,11 +385,20 @@ async def _research_nonprofit_web(
                 })
                 return result
 
-            # Quick positive — all billable fields INCLUDING event_url
+            # Quick positive — only early-stop if ALL fields are filled
             if scan.get("has_event") and scan.get("confidence", 0) >= 0.85:
                 full_from_scan = _quick_scan_to_full(scan, nonprofit)
                 tier, price = classify_lead_tier(full_from_scan)
-                if tier == "full" and _has_valid_url(full_from_scan):
+                _all_filled = (
+                    tier == "full"
+                    and _has_valid_url(full_from_scan)
+                    and full_from_scan.get("evidence_date", "").strip()
+                    and full_from_scan.get("contact_role", "").strip()
+                    and full_from_scan.get("organization_address", "").strip()
+                    and full_from_scan.get("organization_phone_maps", "").strip()
+                    and full_from_scan.get("contact_source_url", "").strip()
+                )
+                if _all_filled:
                     full_from_scan["_api_calls"] = api_calls
                     full_from_scan["_phase"] = "quick_scan"
                     full_from_scan["_processed_at"] = datetime.now(timezone.utc).isoformat()
@@ -379,9 +406,17 @@ async def _research_nonprofit_web(
 
                     if user_id and not is_admin:
                         fee = get_research_fee_cents(total)
-                        charge_research_fee(user_id, 1, job_id, fee)
-                        charge_lead_fee(user_id, tier, price, job_id, nonprofit)
-                        progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                        total_charge = fee + price
+                        if get_balance(user_id) >= total_charge:
+                            charge_research_fee(user_id, 1, job_id, fee)
+                            charge_lead_fee(user_id, tier, price, job_id, nonprofit)
+                            progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                        else:
+                            if balance_stop:
+                                balance_stop.set()
+                            full_from_scan["_balance_exhausted"] = True
+                            progress_q.put({"type": "balance_warning", "message": "Insufficient balance — stopping job."})
+                            tier, price = "not_billable", 0
 
                     progress_q.put({
                         "type": "result", "index": index, "total": total,
@@ -407,8 +442,13 @@ async def _research_nonprofit_web(
 
                 if user_id and not is_admin and not is_trial:
                     fee = get_research_fee_cents(total)
-                    charge_research_fee(user_id, 1, job_id, fee)
-                    progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                    if get_balance(user_id) >= fee:
+                        charge_research_fee(user_id, 1, job_id, fee)
+                        progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                    else:
+                        if balance_stop:
+                            balance_stop.set()
+                        progress_q.put({"type": "balance_warning", "message": "Insufficient balance — stopping job."})
 
                 progress_q.put({
                     "type": "result", "index": index, "total": total,
@@ -421,24 +461,24 @@ async def _research_nonprofit_web(
             tier, price = classify_lead_tier(result)
             missing = _missing_billable_fields(result)
 
-            # ── Phase 3: Targeted Follow-up ──
-            if len(missing) == 1 and result.get("event_title", "").strip():
-                api_calls += 1
-                field = missing[0]
-                try:
-                    followup = await _targeted_followup(
-                        client, nonprofit,
-                        result.get("event_title", ""),
-                        result.get("event_date", ""),
-                        field,
-                    )
-                    value = followup.get(field, "").strip()
-                    if value:
-                        result[field] = value
-                        if followup.get("source_url"):
-                            result["contact_source_url"] = followup["source_url"]
-                except Exception:
-                    pass
+            # ── Phase 3: Targeted Follow-up (chase up to 3 missing fields) ──
+            if missing and result.get("event_title", "").strip():
+                for field in missing[:3]:
+                    api_calls += 1
+                    try:
+                        followup = await _targeted_followup(
+                            client, nonprofit,
+                            result.get("event_title", ""),
+                            result.get("event_date", ""),
+                            field,
+                        )
+                        value = followup.get(field, "").strip()
+                        if value:
+                            result[field] = value
+                            if followup.get("source_url"):
+                                result["contact_source_url"] = followup["source_url"]
+                    except Exception:
+                        pass
 
             # Final classification
             tier, price = classify_lead_tier(result)
@@ -448,19 +488,36 @@ async def _research_nonprofit_web(
             result["_phase"] = f"phase_{api_calls}"
 
             # Charge fees (trial users: only charged for billable results)
+            # Mid-job balance guard: check balance before each charge
             if user_id and not is_admin:
+                fee = get_research_fee_cents(total)
+                bal = get_balance(user_id)
                 if is_trial:
                     if price > 0:
-                        fee = get_research_fee_cents(total)
-                        charge_research_fee(user_id, 1, job_id, fee)
-                        charge_lead_fee(user_id, tier, price, job_id, nonprofit)
-                        progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                        total_charge = fee + price
+                        if bal >= total_charge:
+                            charge_research_fee(user_id, 1, job_id, fee)
+                            charge_lead_fee(user_id, tier, price, job_id, nonprofit)
+                            progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                        else:
+                            if balance_stop:
+                                balance_stop.set()
+                            result["_balance_exhausted"] = True
+                            progress_q.put({"type": "balance_warning", "message": "Insufficient balance — stopping job."})
+                            tier, price = "not_billable", 0
                 else:
-                    fee = get_research_fee_cents(total)
-                    charge_research_fee(user_id, 1, job_id, fee)
-                    if price > 0:
-                        charge_lead_fee(user_id, tier, price, job_id, nonprofit)
-                    progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                    total_charge = fee + (price if price > 0 else 0)
+                    if bal >= total_charge:
+                        charge_research_fee(user_id, 1, job_id, fee)
+                        if price > 0:
+                            charge_lead_fee(user_id, tier, price, job_id, nonprofit)
+                        progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                    else:
+                        if balance_stop:
+                            balance_stop.set()
+                        result["_balance_exhausted"] = True
+                        progress_q.put({"type": "balance_warning", "message": "Insufficient balance — stopping job."})
+                        tier, price = "not_billable", 0
 
             progress_q.put({
                 "type": "result", "index": index, "total": total,
@@ -482,8 +539,9 @@ async def _research_nonprofit_web(
             # Charge research fee on error (trial users: free on errors)
             if user_id and not is_admin and not is_trial:
                 fee = get_research_fee_cents(total)
-                charge_research_fee(user_id, 1, job_id, fee)
-                progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                if get_balance(user_id) >= fee:
+                    charge_research_fee(user_id, 1, job_id, fee)
+                    progress_q.put({"type": "balance", "balance": get_balance(user_id)})
             return _error_result(nonprofit, "Failed to parse response as JSON", text[:500] if text else "")
 
         except Exception as e:
@@ -495,8 +553,9 @@ async def _research_nonprofit_web(
             })
             if user_id and not is_admin and not is_trial:
                 fee = get_research_fee_cents(total)
-                charge_research_fee(user_id, 1, job_id, fee)
-                progress_q.put({"type": "balance", "balance": get_balance(user_id)})
+                if get_balance(user_id) >= fee:
+                    charge_research_fee(user_id, 1, job_id, fee)
+                    progress_q.put({"type": "balance", "balance": get_balance(user_id)})
             return _error_result(nonprofit, str(e))
 
 
@@ -522,9 +581,18 @@ async def _run_job(
 
     all_results: List[Dict[str, Any]] = []
     billing_summary = {"research_fees": 0, "lead_fees": {}, "total_charged": 0}
+    balance_stop = asyncio.Event()  # Set when balance is exhausted mid-job
     start = time.time()
 
     for i in range(0, total_batches, MAX_PARALLEL_BATCHES):
+        # Check if balance was exhausted by a previous batch group
+        if balance_stop.is_set() and not is_admin:
+            skipped = sum(len(b) for b in batches[i:])
+            progress_q.put({
+                "type": "balance_warning",
+                "message": f"Job stopped early — insufficient balance. {skipped} nonprofit(s) skipped.",
+            })
+            break
         group = batches[i:i + MAX_PARALLEL_BATCHES]
         global_offset = sum(len(b) for b in batches[:i])
 
@@ -537,6 +605,7 @@ async def _run_job(
                         client, np_name, semaphore, offset + k + 1,
                         len(nonprofits), progress_q,
                         user_id=user_id, job_id=job_id, is_admin=is_admin, is_trial=is_trial,
+                        balance_stop=balance_stop,
                     )
                 )
 
@@ -621,7 +690,7 @@ async def _run_job(
         },
         "summary": {
             "found": sum(1 for r in all_results if r.get("status") == "found"),
-            "external_found": sum(1 for r in all_results if r.get("status") == "external_found"),
+            "3rdpty_found": sum(1 for r in all_results if r.get("status") == "3rdpty_found"),
             "not_found": sum(1 for r in all_results if r.get("status") == "not_found"),
             "uncertain": sum(1 for r in all_results if r.get("status") == "uncertain"),
         },
@@ -664,7 +733,7 @@ async def _run_job(
     jobs[job_id]["results"] = output
 
     # Persist job completion to SQLite
-    found_count = output["summary"].get("found", 0) + output["summary"].get("external_found", 0)
+    found_count = output["summary"].get("found", 0) + output["summary"].get("3rdpty_found", 0)
     billable_count = len(save_results) if not is_admin else found_count
     total_cost_cents = billing_summary["total_charged"] if not is_admin else 0
     complete_search_job(
@@ -1130,22 +1199,45 @@ def start_search():
     is_trial = session.get("is_trial", False)
 
     # Pre-search balance check for non-admin
+    # Estimates TOTAL cost including research fees + estimated lead fees
+    # Conservative hit rate: 55%, avg lead price: $1.40 (most leads are "full" at $1.50)
+    ESTIMATED_HIT_RATE = 0.55
+    ESTIMATED_AVG_LEAD_CENTS = 140  # weighted average across tiers
+
     if not is_admin:
         balance = get_balance(user_id)
+        count = len(nonprofits)
+        fee_per = get_research_fee_cents(count)
+
         if is_trial:
-            # Trial users only pay for real results — just need positive balance
+            # Trial users only pay for real results — estimate lead fees only
+            estimated_lead_cost = int(count * ESTIMATED_HIT_RATE * ESTIMATED_AVG_LEAD_CENTS)
             if balance <= 0:
                 return jsonify({
                     "error": "Trial balance exhausted. Top up your wallet to continue searching."
                 }), 402
-        else:
-            fee_per = get_research_fee_cents(len(nonprofits))
-            estimated_cost = len(nonprofits) * fee_per
-            if balance < estimated_cost:
-                need = estimated_cost / 100
-                have = balance / 100
+            if balance < estimated_lead_cost:
+                cost_per_np = int(ESTIMATED_HIT_RATE * ESTIMATED_AVG_LEAD_CENTS)
+                max_affordable = max(1, balance // cost_per_np) if cost_per_np > 0 else count
                 return jsonify({
-                    "error": f"Insufficient balance. Need ${need:.2f} research fee, have ${have:.2f}. Top up your wallet first."
+                    "error": f"Your balance of ${balance/100:.2f} can cover approximately {max_affordable} nonprofits. Please reduce your list or add funds.",
+                    "affordable_count": max_affordable,
+                    "balance_cents": balance,
+                    "estimated_cost_cents": estimated_lead_cost,
+                }), 402
+        else:
+            research_cost = count * fee_per
+            estimated_lead_cost = int(count * ESTIMATED_HIT_RATE * ESTIMATED_AVG_LEAD_CENTS)
+            estimated_total = research_cost + estimated_lead_cost
+
+            if balance < estimated_total:
+                cost_per_np = fee_per + int(ESTIMATED_HIT_RATE * ESTIMATED_AVG_LEAD_CENTS)
+                max_affordable = max(1, balance // cost_per_np) if cost_per_np > 0 else count
+                return jsonify({
+                    "error": f"Your balance of ${balance/100:.2f} can cover approximately {max_affordable} nonprofits (estimated cost: ${estimated_total/100:.2f}). Please reduce your list or add funds.",
+                    "affordable_count": max_affordable,
+                    "balance_cents": balance,
+                    "estimated_cost_cents": estimated_total,
                 }), 402
 
     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
@@ -1171,10 +1263,18 @@ def start_search():
     )
     thread.start()
 
+    # Build estimated cost for frontend display
+    _count = len(nonprofits)
+    _fee_per = get_research_fee_cents(_count)
+    _research_total = _count * _fee_per
+    _lead_est = int(_count * ESTIMATED_HIT_RATE * ESTIMATED_AVG_LEAD_CENTS)
+    _est_total = _research_total + _lead_est
+
     return jsonify({
         "job_id": job_id,
-        "total": len(nonprofits),
-        "research_fee_each": get_research_fee_cents(len(nonprofits)),
+        "total": _count,
+        "research_fee_each": _fee_per,
+        "estimated_cost_cents": _est_total if not is_admin else 0,
     })
 
 
@@ -2038,7 +2138,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .terminal .line { padding: 2px 0; }
   .terminal .line.processing { color: #a3a3a3; }
   .terminal .line.found { color: #4ade80; }
-  .terminal .line.external_found { color: #eab308; }
+  .terminal .line.thirdpty_found { color: #eab308; }
   .terminal .line.not_found { color: #f87171; }
   .terminal .line.uncertain { color: #fbbf24; }
   .terminal .line.error { color: #f87171; }
@@ -2100,7 +2200,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     <div class="stats">
       <div class="stat found"><div class="num" id="statFound">0</div><div class="label">Found</div></div>
-      <div class="stat external"><div class="num" id="statExternal">0</div><div class="label">External</div></div>
+      <div class="stat external"><div class="num" id="statExternal">0</div><div class="label">3rd Party</div></div>
       <div class="stat notfound"><div class="num" id="statNotFound">0</div><div class="label">Not Found</div></div>
       <div class="stat uncertain"><div class="num" id="statUncertain">0</div><div class="label">Uncertain</div></div>
     </div>
@@ -2142,7 +2242,7 @@ if (!IS_ADMIN) {
   balDisplay.textContent = '$' + (balanceCents / 100).toFixed(2);
 }
 
-let counts = { found: 0, external_found: 0, not_found: 0, uncertain: 0, error: 0 };
+let counts = { found: 0, '3rdpty_found': 0, not_found: 0, uncertain: 0, error: 0 };
 let processed = 0;
 let totalNonprofits = 0;
 let currentJobId = null;
@@ -2177,8 +2277,10 @@ function timestamp() {
 
 function log(msg, cls) {
   cls = cls || '';
+  // CSS classes can't start with a digit — remap 3rdpty_found
+  const cssClass = cls === '3rdpty_found' ? 'thirdpty_found' : cls;
   const line = document.createElement('div');
-  line.className = 'line ' + cls;
+  line.className = 'line ' + cssClass;
   line.innerHTML = '<span class="timestamp">[' + timestamp() + ']</span> ' + escapeHtml(msg);
   terminal.appendChild(line);
   terminal.scrollTop = terminal.scrollHeight;
@@ -2192,7 +2294,7 @@ function escapeHtml(text) {
 
 function updateStats() {
   document.getElementById('statFound').textContent = counts.found;
-  document.getElementById('statExternal').textContent = counts.external_found;
+  document.getElementById('statExternal').textContent = counts['3rdpty_found'];
   document.getElementById('statNotFound').textContent = counts.not_found;
   document.getElementById('statUncertain').textContent = counts.uncertain + counts.error;
 }
@@ -2218,7 +2320,7 @@ async function startSearch() {
   downloadSection.style.display = 'none';
   document.getElementById('billingSummary').style.display = 'none';
   terminal.innerHTML = '';
-  counts = { found: 0, external_found: 0, not_found: 0, uncertain: 0, error: 0 };
+  counts = { found: 0, '3rdpty_found': 0, not_found: 0, uncertain: 0, error: 0 };
   processed = 0;
   totalNonprofits = 0;
   updateStats();
@@ -2235,16 +2337,24 @@ async function startSearch() {
 
     if (!res.ok) {
       const err = await res.json();
-      log('Error: ' + (err.error || 'Unknown error'), 'error');
+      if (res.status === 402 && err.affordable_count) {
+        log('Insufficient balance: ' + err.error, 'error');
+        log('Tip: Reduce your list to ~' + err.affordable_count + ' nonprofits, or top up your wallet.', 'info');
+      } else {
+        log('Error: ' + (err.error || 'Unknown error'), 'error');
+      }
       searchBtn.disabled = false;
       return;
     }
 
-    const { job_id, total, research_fee_each } = await res.json();
+    const { job_id, total, research_fee_each, estimated_cost_cents } = await res.json();
     totalNonprofits = total;
     currentJobId = job_id;
     if (!IS_ADMIN) {
       log('Research fee: $' + (total * research_fee_each / 100).toFixed(2) + ' (' + total + ' x $' + (research_fee_each/100).toFixed(2) + ')', 'info');
+      if (estimated_cost_cents > 0) {
+        log('Estimated total cost (incl. lead fees): ~$' + (estimated_cost_cents / 100).toFixed(2), 'info');
+      }
     }
     log('Job started: ' + job_id + ' (' + total + ' nonprofits)', 'info');
     updateProgress();
@@ -2299,6 +2409,10 @@ async function startSearch() {
           updateProgress();
           break;
 
+        case 'balance_warning':
+          log('BALANCE WARNING: ' + data.message, 'error');
+          break;
+
         case 'batch_done':
           log('--- Batch complete: ' + data.processed + '/' + data.total + ' processed ---', 'info');
           break;
@@ -2306,7 +2420,7 @@ async function startSearch() {
         case 'complete':
           log('', '');
           log('SEARCH COMPLETE in ' + data.elapsed + 's', 'complete');
-          log('Found: ' + data.summary.found + ' | External: ' + data.summary.external_found +
+          log('Found: ' + data.summary.found + ' | 3rd Party: ' + data.summary['3rdpty_found'] +
               ' | Not Found: ' + data.summary.not_found + ' | Uncertain: ' + data.summary.uncertain, 'complete');
 
           // Show billing summary for non-admin

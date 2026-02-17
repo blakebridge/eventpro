@@ -122,7 +122,15 @@ Follow these steps IN ORDER for each nonprofit:
 
 4. **General Web Search**: Search for "[nonprofit name] gala 2026", "[nonprofit name] auction 2026", "[nonprofit name] fundraiser auction 2026", "[nonprofit name] gala 2027", "[nonprofit name] silent auction 2026", "[nonprofit name] benefit dinner 2026".
 
-5. **Contact Information**: Find a contact person for the event — look for sponsorship contacts, event coordinators, or development staff. Also find the organization's physical address and phone number (check footer, contact page, or Google Maps).
+5. **Contact Information**: Find a contact person for the event AND their job title:
+   - First check the event page itself for contact info
+   - Then check the org's /about, /staff, /team, /leadership, /our-team, /contact, /directory, /news, /blog pages
+   - NEVER use email addresses found in the website footer — those are sitewide generic emails, not event contacts. Only use emails found on the actual event page, staff page, or contact directory.
+   - For job title, the org's own website is the MOST TRUSTED source — search their site first
+   - Search Google for "[contact name] [org name]" — org website results often show their title in snippets
+   - Only use LinkedIn as a LAST RESORT if the org site doesn't show the title: search "[contact name] [org name] title"
+   - contact_role must be their ACTUAL job title (e.g. "Engagement Specialist", "Director of Development"), not a generic label
+   - Also find the organization's physical address and phone number (check footer, contact page, or Google Maps)
 
 ## CRITICAL DATE REQUIREMENT
 - Today's date is February 2026.
@@ -138,7 +146,7 @@ Follow these steps IN ORDER for each nonprofit:
 
 ## Classification
 - "found" — auction event confirmed on the nonprofit's official domain
-- "external_found" — auction event found on a third-party platform
+- "3rdpty_found" — auction event found on a third-party platform
 - "not_found" — no upcoming auction events discovered anywhere
 - "uncertain" — ambiguous results needing human review
 
@@ -162,7 +170,7 @@ You MUST respond with ONLY valid JSON (no markdown fences, no extra text) in thi
   "organization_phone_maps": "phone number",
   "contact_source_url": "URL where contact info was found",
   "event_summary": "1-2 sentence summary explaining what was found and how it was confirmed",
-  "status": "found or external_found or not_found or uncertain"
+  "status": "found or 3rdpty_found or not_found or uncertain"
 }
 
 ## Few-Shot Examples
@@ -184,14 +192,20 @@ Output:
 
 ## CRITICAL RULES
 - Return ONLY the JSON object, no markdown code fences, no explanation before or after
-- evidence_date and evidence_auction must be ACTUAL text copied from the source pages
+- evidence_date and evidence_auction must be ACTUAL text copied from the source pages — NEVER leave these blank when event_date or auction_type is filled in. You saw the text on the page — copy it verbatim.
 - event_date must be in M/D/YYYY format (no leading zeros required)
 - confidence_score must be a number between 0.0 and 1.0
 - If multiple auction events exist, return the EARLIEST upcoming one (2026 or later)
 - If no auction event is found, return the not_found template with empty strings
 - ONLY events from 2026 or later are valid — IGNORE all 2025 or earlier events
 - Search thoroughly: check the actual event page URL, look for "Save the Date" text, check for dates like "September 17, 2026" that may be buried in the page content
-- Look for paddle raise, fund-a-need, raise the paddle — these count as auction components"""
+- Look for paddle raise, fund-a-need, raise the paddle — these count as auction components
+
+## URL QUALITY RULES — MANDATORY
+- NEVER fabricate or guess URLs — every URL you return must be a real page you actually visited
+- NEVER construct search/query URLs like "/search?query=..." — those are NOT valid
+- event_url: If the event has a dedicated auction page (e.g. /auction, /silent-auction, /gala-auction), use THAT instead of a generic page like /annual-dinner or /events. The most specific auction-related URL wins.
+- contact_source_url: MUST be the real URL where you found the contact name/email. If you found contact info, you found it somewhere — record that URL. NEVER leave this blank when contact_name or contact_email is filled in."""
 
 
 def extract_json(text: str) -> dict:
@@ -317,9 +331,33 @@ def classify_lead_tier(result: Dict[str, Any]) -> tuple:
 
 # ─── Quick Scan Prompt ────────────────────────────────────────────────────────
 
-QUICK_SCAN_PROMPT = """You are a quick-check assistant. Determine if the following nonprofit organization has any upcoming auction, gala, or fundraiser events (2026 or later) that include an auction component (silent auction, live auction, paddle raise, etc.).
+QUICK_SCAN_PROMPT = """You are a nonprofit auction event researcher. Determine if the following nonprofit has any upcoming auction/gala/fundraiser events (2026 or later) with an auction component (silent auction, live auction, paddle raise, etc.).
 
-Search the web for "{nonprofit}" upcoming events. IMPORTANT: If you find an event, you MUST visit the actual event page and extract the URL. Do NOT rely only on search result snippets — go to the page and confirm the details.
+Search the web for "{nonprofit}" upcoming events. If you find an event, you MUST visit the actual event page. Do NOT rely only on search snippets.
+
+## YOUR #1 GOAL: FILL IN EVERY SINGLE FIELD BELOW
+An incomplete result is a POOR result. Every blank field is a failure. Search multiple pages to fill all fields.
+
+## SEARCH STEPS (do ALL of these):
+1. Find the event page — get event_title, event_date, evidence_date, auction_type, evidence_auction, event_url
+2. Find a contact person — check the event page, then /about, /staff, /team, /contact pages for name + email
+     IMPORTANT: NEVER use email addresses found in the website footer — those are sitewide generic emails, not event contacts. Only use emails found on the actual event page, staff page, or contact directory.
+3. Find their job title — PRIORITY ORDER:
+     a. Check the org's own website first: /about, /staff, /team, /news, /blog pages — the org site is the MOST TRUSTED source
+     b. Search Google for "[name] [org name]" — the org's own pages often appear showing their title
+     c. Only if not found on org site, try LinkedIn: search "[name] [org name] title"
+     The org's own website ALWAYS trumps LinkedIn for job title accuracy.
+4. Find org address + phone — check footer, /contact page, or Google Maps for "[nonprofit name]"
+5. Record contact_source_url — the URL where you found the contact info
+
+## URL RULES
+- event_url must be a REAL page you visited — NEVER fabricate URLs
+- NEVER construct search/query URLs like "/search?query=..."
+- Prefer the most specific auction page URL (e.g. /auction over /annual-dinner)
+
+## EVIDENCE RULES
+- evidence_date: copy the RAW date text from the page verbatim (e.g. "Saturday, April 10, 2026 | 6:00 PM"). NEVER blank when event_date is filled.
+- evidence_auction: copy the RAW text proving auction exists. NEVER blank when auction_type is filled.
 
 Respond with ONLY valid JSON (no markdown, no extra text):
 {{
@@ -328,11 +366,16 @@ Respond with ONLY valid JSON (no markdown, no extra text):
   "nonprofit_name": "Full Name",
   "event_title": "Event Title or empty string",
   "event_date": "M/D/YYYY or empty string",
-  "event_url": "https://direct-url-to-event-page or empty string",
+  "evidence_date": "Raw date text copied from the page",
+  "event_url": "https://most-specific-auction-page-url or empty string",
   "auction_type": "silent/live/Live and Silent or empty string",
   "contact_name": "Name or empty string",
   "contact_email": "email or empty string",
-  "evidence_auction": "Text from the page proving auction exists or empty string",
+  "contact_role": "Actual job title from staff page or LinkedIn",
+  "organization_address": "Full street address, City, ST ZIP",
+  "organization_phone_maps": "Phone number from website or Google Maps",
+  "contact_source_url": "URL where contact info was found",
+  "evidence_auction": "Raw text from page proving auction exists",
   "notes": "Brief explanation"
 }}"""
 
@@ -342,7 +385,14 @@ Organization: {nonprofit}
 Event: {event_title}
 Event Date: {event_date}
 
-Search the web for this event. If looking for event_url, you MUST find and visit the actual event page (not just a search snippet) and return the direct URL. Look on the organization's official website first.
+## Search strategy by field type:
+- event_url: Find and visit the actual event/auction page on the org's website. Prefer /auction over /events.
+- contact_email: Check /contact, /staff, /about, /team pages on the org website.
+- contact_role: FIRST check the org's own website (/about, /staff, /team, /news, /blog). If not found, search Google for the contact person's name + org name. The org site ALWAYS trumps LinkedIn.
+- organization_address: Check the org's /contact page, website footer, or search Google Maps for the org name.
+- organization_phone_maps: Check the org's /contact page, website footer, or Google Maps listing.
+
+NEVER fabricate or guess URLs. NEVER construct search/query URLs like "/search?query=...". Only return URLs of real pages you actually visited.
 
 Respond with ONLY valid JSON (no markdown):
 {{
@@ -407,8 +457,13 @@ def _quick_scan_to_full(scan: Dict[str, Any], nonprofit: str) -> Dict[str, Any]:
     result["event_date"] = scan.get("event_date", "")
     result["event_url"] = scan.get("event_url", "")
     result["auction_type"] = scan.get("auction_type", "")
+    result["evidence_date"] = scan.get("evidence_date", "")
     result["contact_name"] = scan.get("contact_name", "")
     result["contact_email"] = scan.get("contact_email", "")
+    result["contact_role"] = scan.get("contact_role", "")
+    result["organization_address"] = scan.get("organization_address", "")
+    result["organization_phone_maps"] = scan.get("organization_phone_maps", "")
+    result["contact_source_url"] = scan.get("contact_source_url", "")
     result["confidence_score"] = scan.get("confidence", 0.0)
     result["evidence_auction"] = scan.get("evidence_auction", "")
     result["event_summary"] = scan.get("notes", "")
@@ -417,8 +472,10 @@ def _quick_scan_to_full(scan: Dict[str, Any], nonprofit: str) -> Dict[str, Any]:
 
 
 def _missing_billable_fields(result: Dict[str, Any]) -> List[str]:
-    """Return list of key billable fields that are missing/empty."""
+    """Return list of important fields that are missing/empty.
+    Prioritized: billing-critical fields first, then completeness fields."""
     missing = []
+    # Billing-critical (affect tier/price)
     if not _has_valid_url(result):
         missing.append("event_url")
     if not _is_valid_email(result.get("contact_email", "")):
@@ -427,6 +484,13 @@ def _missing_billable_fields(result: Dict[str, Any]) -> List[str]:
         missing.append("event_date")
     if not result.get("auction_type", "").strip():
         missing.append("auction_type")
+    # Completeness fields (every field matters)
+    if not result.get("contact_role", "").strip():
+        missing.append("contact_role")
+    if not result.get("organization_address", "").strip():
+        missing.append("organization_address")
+    if not result.get("organization_phone_maps", "").strip():
+        missing.append("organization_phone_maps")
     return missing
 
 
@@ -459,13 +523,20 @@ async def research_nonprofit(
                 result["_source"] = "gemini"
                 return result
 
-            # Quick positive — high confidence with all billable fields INCLUDING event_url
+            # Quick positive — only early-stop if ALL fields are filled
             if scan.get("has_event") and scan.get("confidence", 0) >= 0.85:
                 full_from_scan = _quick_scan_to_full(scan, nonprofit)
                 tier, _ = classify_lead_tier(full_from_scan)
-                has_source_url = bool(full_from_scan.get("contact_source_url", "").strip())
-                # Only stop at Phase 1 if tier is "full", we have a real URL, AND contact_source_url
-                if tier == "full" and _has_valid_url(full_from_scan) and has_source_url:
+                _all_filled = (
+                    tier == "full"
+                    and _has_valid_url(full_from_scan)
+                    and full_from_scan.get("evidence_date", "").strip()
+                    and full_from_scan.get("contact_role", "").strip()
+                    and full_from_scan.get("organization_address", "").strip()
+                    and full_from_scan.get("organization_phone_maps", "").strip()
+                    and full_from_scan.get("contact_source_url", "").strip()
+                )
+                if _all_filled:
                     print(f"  [{index}/{total}] FOUND (quick-full): {nonprofit} -> {scan.get('event_title', '')}", file=sys.stderr)
                     full_from_scan["_api_calls"] = api_calls
                     full_from_scan["_phase"] = "quick_scan"
@@ -501,25 +572,25 @@ async def research_nonprofit(
                 result["_phase"] = "deep_research"
                 return result
 
-            # ── Phase 3: Targeted Follow-up (only if missing exactly 1 field) ──
-            if len(missing) == 1 and result.get("event_title", "").strip():
-                api_calls += 1
-                field = missing[0]
-                print(f"  [{index}/{total}] Phase 3 (targeted: {field}): {nonprofit}", file=sys.stderr)
-                try:
-                    followup = await _targeted_followup(
-                        client, nonprofit,
-                        result.get("event_title", ""),
-                        result.get("event_date", ""),
-                        field,
-                    )
-                    value = followup.get(field, "").strip()
-                    if value:
-                        result[field] = value
-                        if followup.get("source_url"):
-                            result["contact_source_url"] = followup["source_url"]
-                except Exception:
-                    pass  # Phase 3 failure is non-fatal
+            # ── Phase 3: Targeted Follow-up (chase up to 3 missing fields) ──
+            if missing and result.get("event_title", "").strip():
+                for field in missing[:3]:
+                    api_calls += 1
+                    print(f"  [{index}/{total}] Phase 3 (targeted: {field}): {nonprofit}", file=sys.stderr)
+                    try:
+                        followup = await _targeted_followup(
+                            client, nonprofit,
+                            result.get("event_title", ""),
+                            result.get("event_date", ""),
+                            field,
+                        )
+                        value = followup.get(field, "").strip()
+                        if value:
+                            result[field] = value
+                            if followup.get("source_url"):
+                                result["contact_source_url"] = followup["source_url"]
+                    except Exception:
+                        pass  # Phase 3 failure is non-fatal
 
             # Final classification
             tier, _ = classify_lead_tier(result)
@@ -671,7 +742,7 @@ def write_json(results: List[Dict[str, Any]], filepath: str, elapsed: float) -> 
         },
         "summary": {
             "found": sum(1 for r in results if r.get("status") == "found"),
-            "external_found": sum(1 for r in results if r.get("status") == "external_found"),
+            "3rdpty_found": sum(1 for r in results if r.get("status") == "3rdpty_found"),
             "not_found": sum(1 for r in results if r.get("status") == "not_found"),
             "uncertain": sum(1 for r in results if r.get("status") == "uncertain"),
         },
@@ -747,7 +818,7 @@ def main():
 
     # Summary
     found = sum(1 for r in results if r.get("status") == "found")
-    external = sum(1 for r in results if r.get("status") == "external_found")
+    external = sum(1 for r in results if r.get("status") == "3rdpty_found")
     not_found = sum(1 for r in results if r.get("status") == "not_found")
     uncertain = sum(1 for r in results if r.get("status") == "uncertain")
 
@@ -756,7 +827,7 @@ def main():
     print(f"{'=' * 60}", file=sys.stderr)
     print(f"  Total processed:  {len(results)}", file=sys.stderr)
     print(f"  Found:            {found}", file=sys.stderr)
-    print(f"  External found:   {external}", file=sys.stderr)
+    print(f"  3rd Party found:  {external}", file=sys.stderr)
     print(f"  Not found:        {not_found}", file=sys.stderr)
     print(f"  Uncertain:        {uncertain}", file=sys.stderr)
     print(f"  Time elapsed:     {elapsed:.1f}s", file=sys.stderr)
