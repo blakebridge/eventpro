@@ -242,10 +242,15 @@ def _build_sidebar_html(active):
     )
 
 
+_FAVICON_TAG = '<link rel="icon" type="image/png" href="/static/favicon.png">'
+
 def _inject_sidebar(html, active):
     """Replace {{SIDEBAR_HTML}} placeholder with built sidebar, and {{SIDEBAR_CSS}} with CSS."""
     html = html.replace("{{SIDEBAR_CSS}}", _SIDEBAR_CSS)
     html = html.replace("{{SIDEBAR_HTML}}", _build_sidebar_html(active))
+    # Inject favicon into all sidebar pages
+    if _FAVICON_TAG not in html:
+        html = html.replace("</head>", _FAVICON_TAG + "\n</head>", 1)
     return html
 
 
@@ -1553,6 +1558,7 @@ REGISTER_HTML = f"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AUCTIONFINDER - Register</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{_BASE_STYLE}
   body {{ display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
   .auth-box {{ width: 460px; }}
@@ -1591,6 +1597,7 @@ LOGIN_HTML = f"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AUCTIONFINDER - Login</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{_BASE_STYLE}
   body {{ display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
 </style>
@@ -1615,6 +1622,7 @@ FORGOT_PASSWORD_HTML = f"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AUCTIONFINDER - Forgot Password</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{_BASE_STYLE}
   body {{ display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
 </style>
@@ -1637,6 +1645,7 @@ RESET_PASSWORD_HTML = f"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AUCTIONFINDER - Reset Password</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{_BASE_STYLE}
   body {{ display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
 </style>
@@ -3037,6 +3046,7 @@ LANDING_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Auction Intel - Find Nonprofit Auction Events at Scale</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #000000; color: #f5f5f5; }
@@ -3072,7 +3082,7 @@ LANDING_HTML = """<!DOCTYPE html>
   .stats-bar { display: flex; justify-content: center; gap: 60px; padding: 48px 40px; border-top: 1px solid #1a1a1a; border-bottom: 1px solid #1a1a1a; }
   .stats-bar .stat { text-align: center; }
   .stats-bar .stat .num { font-size: 36px; font-weight: 800; color: #eab308; }
-  .stats-bar .stat .lbl { font-size: 13px; color: #737373; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px; }
+  .stats-bar .stat .lbl { font-size: 14px; color: #737373; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px; }
 
   /* Sections */
   section { padding: 100px 40px; }
@@ -3088,15 +3098,15 @@ LANDING_HTML = """<!DOCTYPE html>
   .feature-card:hover { border-color: #262626; }
   .feature-card .icon { width: 48px; height: 48px; background: #1a1500; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 22px; margin-bottom: 20px; }
   .feature-card h3 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
-  .feature-card p { font-size: 14px; color: #a3a3a3; line-height: 1.6; }
+  .feature-card p { font-size: 15px; color: #a3a3a3; line-height: 1.6; }
 
   /* How it works */
   .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 32px; max-width: 1100px; margin: 0 auto; }
   .step { text-align: center; }
   .step .step-num { width: 48px; height: 48px; border: 2px solid #eab308; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 800; color: #eab308; margin: 0 auto 16px; }
-  .step h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
-  .step p { font-size: 14px; color: #a3a3a3; line-height: 1.5; }
-  .step .phases { text-align: left; margin-top: 8px; font-size: 13px; color: #737373; line-height: 1.6; }
+  .step h3 { font-size: 17px; font-weight: 600; margin-bottom: 8px; }
+  .step p { font-size: 15px; color: #a3a3a3; line-height: 1.5; }
+  .step .phases { text-align: left; margin-top: 8px; font-size: 14px; color: #737373; line-height: 1.6; }
   .step .phases strong { color: #a3a3a3; }
 
   /* Pricing */
@@ -3108,7 +3118,7 @@ LANDING_HTML = """<!DOCTYPE html>
   .price-card .price-tag { font-size: 14px; color: #a3a3a3; margin-bottom: 20px; }
   .price-card .price-tag b { font-size: 36px; color: #f5f5f5; font-weight: 800; }
   .price-card ul { list-style: none; }
-  .price-card ul li { padding: 8px 0; font-size: 14px; color: #d4d4d4; border-bottom: 1px solid #1a1a1a; }
+  .price-card ul li { padding: 8px 0; font-size: 15px; color: #d4d4d4; border-bottom: 1px solid #1a1a1a; }
   .price-card ul li::before { content: "\\2713"; color: #4ade80; margin-right: 10px; font-weight: 700; }
   .price-card ul li:last-child { border-bottom: none; }
   .price-card .signup-btn { display: block; text-align: center; margin-top: 24px; padding: 14px; background: #ffd900; color: #000; border-radius: 10px; font-size: 15px; font-weight: 700; }
@@ -3117,7 +3127,7 @@ LANDING_HTML = """<!DOCTYPE html>
   .price-card.std .signup-btn:hover { border-color: #eab308; color: #eab308; }
   .pricing-note { text-align: center; margin-top: 32px; font-size: 15px; color: #a3a3a3; }
   .pricing-note strong { color: #eab308; }
-  .pricing-bonus { text-align: center; margin-top: 16px; font-size: 14px; color: #737373; }
+  .pricing-bonus { text-align: center; margin-top: 16px; font-size: 15px; color: #737373; }
 
   /* FAQ */
   .faq-list { max-width: 720px; margin: 0 auto; }
@@ -3125,13 +3135,13 @@ LANDING_HTML = """<!DOCTYPE html>
   .faq-q { padding: 20px 0; font-size: 16px; font-weight: 600; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
   .faq-q:hover { color: #eab308; }
   .faq-q .arrow { font-size: 20px; color: #525252; transition: transform 0.2s; }
-  .faq-a { display: none; padding: 0 0 20px; font-size: 14px; color: #a3a3a3; line-height: 1.7; }
+  .faq-a { display: none; padding: 0 0 20px; font-size: 15px; color: #a3a3a3; line-height: 1.7; }
   .faq-item.open .faq-a { display: block; }
   .faq-item.open .arrow { transform: rotate(45deg); color: #eab308; }
 
   /* CTA */
   .final-cta { text-align: center; padding: 100px 40px; background: radial-gradient(ellipse at 50% 100%, #1a1500 0%, #000000 70%); }
-  .final-cta h2 { font-size: 40px; font-weight: 700; margin-bottom: 16px; }
+  .final-cta h2 { font-size: 34px; font-weight: 700; margin-bottom: 16px; }
   .final-cta p { font-size: 17px; color: #a3a3a3; margin-bottom: 36px; max-width: 500px; margin-left: auto; margin-right: auto; }
   .final-cta .btn-primary { padding: 16px 40px; background: #ffd900; color: #000; border-radius: 10px; font-size: 17px; font-weight: 700; display: inline-block; }
   .final-cta .btn-primary:hover { background: #eab308; }
@@ -3154,6 +3164,7 @@ LANDING_HTML = """<!DOCTYPE html>
     .topnav .btn-login, .topnav .btn-cta { text-align: center; margin-top: 4px; }
     .hero { padding: 100px 20px 60px; }
     .hero h1 { font-size: 28px; }
+    .hero h1 span[style*="font-size:38px"] { font-size: 22px !important; }
     .hero .subtitle { font-size: 16px; margin-bottom: 28px; }
     .hero .cta-row { flex-direction: column; gap: 12px; }
     .hero .cta-row a { width: 100%; text-align: center; }
@@ -3203,7 +3214,7 @@ LANDING_HTML = """<!DOCTYPE html>
 
 <!-- Hero -->
 <div class="hero">
-  <h1>Find <span class="gold">nonprofit auction events.</span> Verified. Exportable. Ready to contact.</h1>
+  <h1><span class="gold">Find nonprofit auction events.</span><br><span style="font-size:38px;">Verified. Exportable. Ready to contact.</span></h1>
   <p class="subtitle">Auction Intel's new Auction Finder Research Engine scans nonprofit websites to find upcoming fundraising events with a live auction, a silent auction, or both. Get high-quality leads with a verified event page link, the event date, event-level contacts (email/phone), the auction type, and more.</p>
   <div class="cta-row">
     <a href="/register" class="btn-primary">Get Started Free</a>
