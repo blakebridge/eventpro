@@ -297,11 +297,11 @@ def classify_lead_tier(result: Dict[str, Any]) -> tuple:
     if has_title and has_date and has_url and has_auction and has_name and has_email:
         tier, price = "full", 150       # $1.50
     elif has_title and has_date and has_url and has_auction and has_email:
-        tier, price = "partial", 100    # $1.00
+        tier, price = "partial", 125    # $1.25
     elif has_title and has_date and has_url and has_email:
-        tier, price = "semi", 75        # $0.75
+        tier, price = "semi", 100       # $1.00
     elif has_title and has_date and has_url:
-        tier, price = "bare", 50        # $0.50
+        tier, price = "bare", 75        # $0.75
 
     # Optional generic email downgrade
     if DOWNGRADE_GENERIC_EMAILS and has_email:
@@ -311,7 +311,7 @@ def classify_lead_tier(result: Dict[str, Any]) -> tuple:
             new_tier = downgrades.get(tier, tier)
             if new_tier != tier:
                 tier = new_tier
-                tier_prices = {"full": 150, "partial": 100, "semi": 75, "bare": 50, "not_billable": 0}
+                tier_prices = {"full": 150, "partial": 125, "semi": 100, "bare": 75, "not_billable": 0}
                 price = tier_prices.get(tier, 0)
 
     return (tier, price)

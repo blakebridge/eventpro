@@ -2749,7 +2749,7 @@ GETTING_STARTED_HTML = """<!DOCTYPE html>
     <div class="step-content">
       <h3>Understand Your Results</h3>
       <p>Each lead includes up to <strong>16 fields</strong>: event title, date, URL, auction type, confidence score, contact name, email, role, address, phone, and evidence text. Leads are classified into tiers:</p>
-      <p style="margin-top:8px;"><strong style="color:#4ade80;">Full ($1.50)</strong> &mdash; all fields + verified URL &nbsp;|&nbsp; <strong style="color:#eab308;">Partial ($1.00)</strong> &mdash; event + auction type + email &nbsp;|&nbsp; <strong style="color:#fbbf24;">Semi ($0.75)</strong> &mdash; event + email &nbsp;|&nbsp; <strong style="color:#a3a3a3;">Bare ($0.50)</strong> &mdash; event + URL only</p>
+      <p style="margin-top:8px;"><strong style="color:#4ade80;">Verified Contact ($1.50)</strong> &mdash; all fields + verified URL &nbsp;|&nbsp; <strong style="color:#eab308;">Verified Email ($1.25)</strong> &mdash; event + auction type + email &nbsp;|&nbsp; <strong style="color:#fbbf24;">Email Only ($1.00)</strong> &mdash; event + email &nbsp;|&nbsp; <strong style="color:#a3a3a3;">Event Only ($0.75)</strong> &mdash; event + URL only</p>
     </div>
   </div>
 
