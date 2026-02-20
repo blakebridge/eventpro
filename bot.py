@@ -32,11 +32,11 @@ import anthropic
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 BATCH_SIZE = 5          # 5 nonprofits per batch
-MAX_PARALLEL_BATCHES = 1  # 1 batch at a time to respect Claude rate limits
+MAX_PARALLEL_BATCHES = 3  # 3 batches (15 concurrent) — Tier 2: 30 web searches/sec
 MAX_NONPROFITS = 1000
-DELAY_BETWEEN_BATCHES = 3  # seconds between batches to avoid rate limits
+DELAY_BETWEEN_BATCHES = 1  # seconds between batches (Tier 2 handles high throughput)
 MAX_RETRIES = 3             # retry 429 errors up to 3 times
-RETRY_BACKOFF = [30, 60, 120]  # seconds to wait before each retry
+RETRY_BACKOFF = [10, 20, 40]  # seconds to wait before each retry
 
 ALLOWLISTED_PLATFORMS = [
     "givesmart.com",
@@ -745,12 +745,20 @@ async def run(nonprofits: List[str]) -> List[Dict[str, Any]]:
 # ─── I/O ──────────────────────────────────────────────────────────────────────
 
 def parse_input(raw: str) -> List[str]:
-    """Parse comma or newline separated nonprofit names/domains."""
+    """Parse comma or newline separated nonprofit names/domains.
+    Filters out lines that are too long or look like documentation text."""
     items = []
     for line in raw.replace(",", "\n").split("\n"):
         item = line.strip()
-        if item:
-            items.append(item)
+        if not item:
+            continue
+        # Skip lines that are too long to be a nonprofit name/domain (max 120 chars)
+        if len(item) > 120:
+            continue
+        # Skip obvious non-nonprofit lines (numbers-only, single words like headers)
+        if item.replace(",", "").replace(".", "").replace("-", "").isdigit():
+            continue
+        items.append(item)
     return items
 
 
