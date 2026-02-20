@@ -32,7 +32,7 @@ import anthropic
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 BATCH_SIZE = 5          # 5 nonprofits per batch
-MAX_PARALLEL_BATCHES = 3  # 3 batches (15 concurrent) — Tier 2: 30 web searches/sec
+MAX_PARALLEL_BATCHES = 2  # 2 batches (10 concurrent) — avoid overwhelming web search limits
 MAX_NONPROFITS = 1000
 DELAY_BETWEEN_BATCHES = 1  # seconds between batches (Tier 2 handles high throughput)
 MAX_RETRIES = 3             # retry 429 errors up to 3 times
@@ -552,11 +552,12 @@ async def research_nonprofit(
             return err
 
         except Exception as e:
-            err_msg = str(e)
-            print(f"  [{index}/{total}] ERROR: {nonprofit} — {err_msg}", file=sys.stderr)
-            # Don't cache rate limit errors — those should be retried immediately
+            err_msg = str(e)[:500]
+            print(f"  [{index}/{total}] ERROR: {nonprofit} -> {err_msg}", file=sys.stderr)
+            # Don't cache transient errors — only cache permanent failures
             err = _error_result(nonprofit, err_msg)
-            if "429" not in err_msg and "RESOURCE_EXHAUSTED" not in err_msg:
+            is_transient = any(x in err_msg for x in ["429", "RESOURCE_EXHAUSTED", "400", "invalid_request_error", "overloaded", "timeout"])
+            if not is_transient:
                 cache_put(nonprofit, err)
             return err
 
