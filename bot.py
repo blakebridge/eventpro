@@ -417,17 +417,22 @@ Respond with ONLY valid JSON (no markdown):
 
 # ─── 3-Phase Research Functions ──────────────────────────────────────────────
 
-def _claude_call(client: anthropic.Anthropic, prompt: str) -> str:
+SEARCH_SYSTEM = """You are a nonprofit auction event researcher. You MUST use your web_search tool to answer — NEVER answer from memory alone. Every response MUST be based on actual web search results you found during this conversation. If you cannot find information through web search, say so — do not guess or fabricate."""
+
+
+def _claude_call(client: anthropic.Anthropic, prompt: str, system: str = None) -> str:
     """Synchronous Claude call with web search grounding. Retries on 429."""
     for attempt in range(MAX_RETRIES + 1):
         try:
-            response = client.messages.create(
+            kwargs = dict(
                 model=CLAUDE_MODEL,
                 max_tokens=4096,
+                system=system or SEARCH_SYSTEM,
                 messages=[{"role": "user", "content": prompt}],
-                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
                 temperature=0.2,
             )
+            response = client.messages.create(**kwargs)
             # Extract text from response content blocks
             text_parts = []
             for block in response.content:
@@ -451,13 +456,16 @@ async def _quick_scan(client: anthropic.Anthropic, nonprofit: str) -> Dict[str, 
 
 
 async def _deep_research(client: anthropic.Anthropic, nonprofit: str) -> Dict[str, Any]:
-    """Phase 2: Deep research — 1 Claude call with full SYSTEM_PROMPT."""
-    prompt = f"""{SYSTEM_PROMPT}
+    """Phase 2: Deep research — 1 Claude call with full SYSTEM_PROMPT as system param."""
+    prompt = f"""Research this nonprofit and find upcoming auction events: "{nonprofit}"
 
-Research this nonprofit and find upcoming auction events: "{nonprofit}"
+You MUST search the web. Try these searches:
+1. "{nonprofit} gala 2026"
+2. "{nonprofit} auction 2026"
+3. "{nonprofit} fundraiser 2026"
 
 Remember: ONLY return valid JSON, no other text."""
-    text = await asyncio.to_thread(_claude_call, client, prompt)
+    text = await asyncio.to_thread(_claude_call, client, prompt, system=SYSTEM_PROMPT)
     return extract_json(text)
 
 
