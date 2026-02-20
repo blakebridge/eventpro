@@ -32,9 +32,11 @@ import anthropic
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 BATCH_SIZE = 5          # 5 nonprofits per batch
-MAX_PARALLEL_BATCHES = 2  # 2 parallel batches
+MAX_PARALLEL_BATCHES = 1  # 1 batch at a time to respect Claude rate limits
 MAX_NONPROFITS = 1000
-DELAY_BETWEEN_BATCHES = 2  # seconds between batches to avoid rate limits
+DELAY_BETWEEN_BATCHES = 3  # seconds between batches to avoid rate limits
+MAX_RETRIES = 3             # retry 429 errors up to 3 times
+RETRY_BACKOFF = [30, 60, 120]  # seconds to wait before each retry
 
 ALLOWLISTED_PLATFORMS = [
     "givesmart.com",
@@ -403,20 +405,29 @@ Respond with ONLY valid JSON (no markdown):
 # ─── 3-Phase Research Functions ──────────────────────────────────────────────
 
 def _claude_call(client: anthropic.Anthropic, prompt: str) -> str:
-    """Synchronous Claude call with web search grounding."""
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-        temperature=0.2,
-    )
-    # Extract text from response content blocks
-    text_parts = []
-    for block in response.content:
-        if hasattr(block, "text"):
-            text_parts.append(block.text)
-    return "\n".join(text_parts)
+    """Synchronous Claude call with web search grounding. Retries on 429."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+                temperature=0.2,
+            )
+            # Extract text from response content blocks
+            text_parts = []
+            for block in response.content:
+                if hasattr(block, "text"):
+                    text_parts.append(block.text)
+            return "\n".join(text_parts)
+        except anthropic.RateLimitError:
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF[attempt]
+                print(f"    [429] Rate limited, waiting {wait}s before retry {attempt + 1}/{MAX_RETRIES}...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                raise
 
 
 async def _quick_scan(client: anthropic.Anthropic, nonprofit: str) -> Dict[str, Any]:
