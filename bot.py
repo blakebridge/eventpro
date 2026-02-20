@@ -121,7 +121,14 @@ Follow these steps IN ORDER for each nonprofit:
 3. **Third-Party Platform Search**: Search these allowlisted auction/event platforms for events by this nonprofit:
    """ + ", ".join(ALLOWLISTED_PLATFORMS) + """
 
-4. **General Web Search**: Search for "[nonprofit name] gala 2026", "[nonprofit name] auction 2026", "[nonprofit name] fundraiser auction 2026", "[nonprofit name] gala 2027", "[nonprofit name] silent auction 2026", "[nonprofit name] benefit dinner 2026".
+4. **General Web Search** (do ALL of these searches — don't skip any):
+   - "[nonprofit name] gala 2026"
+   - "[nonprofit name] auction 2026"
+   - "[nonprofit name] fundraiser 2026"
+   - "[nonprofit name] silent auction 2026"
+   - "[nonprofit name] benefit dinner 2026"
+   - "[nonprofit name] events 2026"
+   If the input is a domain (e.g. mercyhousingct.org), also try: "site:mercyhousingct.org gala" and "site:mercyhousingct.org auction"
 
 5. **Contact Information**: Find a contact person for the event AND their job title:
    - First check the event page itself for contact info
@@ -332,33 +339,39 @@ def classify_lead_tier(result: Dict[str, Any]) -> tuple:
 
 # ─── Quick Scan Prompt ────────────────────────────────────────────────────────
 
-QUICK_SCAN_PROMPT = """You are a nonprofit auction event researcher. Determine if the following nonprofit has any upcoming auction/gala/fundraiser events (2026 or later) with an auction component (silent auction, live auction, paddle raise, etc.).
+QUICK_SCAN_PROMPT = """You are a nonprofit auction event researcher. Find upcoming auction/gala/fundraiser events (2026 or later) with an auction component (silent auction, live auction, paddle raise, etc.) for this nonprofit:
 
-Search the web for "{nonprofit}" upcoming events. If you find an event, you MUST visit the actual event page. Do NOT rely only on search snippets.
+"{nonprofit}"
 
-## YOUR #1 GOAL: FILL IN EVERY SINGLE FIELD BELOW
-An incomplete result is a POOR result. Every blank field is a failure. Search multiple pages to fill all fields.
+## MANDATORY SEARCH STRATEGY — Do ALL of these searches:
 
-## SEARCH STEPS (do ALL of these):
-1. Find the event page — get event_title, event_date, evidence_date, auction_type, evidence_auction, event_url
-2. Find a contact person — check the event page, then /about, /staff, /team, /contact pages for name + email
-     IMPORTANT: NEVER use email addresses found in the website footer — those are sitewide generic emails, not event contacts. Only use emails found on the actual event page, staff page, or contact directory.
-3. Find their job title — PRIORITY ORDER:
-     a. Check the org's own website first: /about, /staff, /team, /news, /blog pages — the org site is the MOST TRUSTED source
-     b. Search Google for "[name] [org name]" — the org's own pages often appear showing their title
-     c. Only if not found on org site, try LinkedIn: search "[name] [org name] title"
-     The org's own website ALWAYS trumps LinkedIn for job title accuracy.
-4. Find org address + phone — check footer, /contact page, or Google Maps for "[nonprofit name]"
-5. Record contact_source_url — the URL where you found the contact info
+**Step 1: Search the org's own website** (MOST IMPORTANT)
+- Search: "{nonprofit} gala 2026"
+- Search: "{nonprofit} auction 2026"
+- Search: "{nonprofit} fundraiser 2026"
+- Search: "{nonprofit} events 2026"
 
-## URL RULES
-- event_url must be a REAL page you visited — NEVER fabricate URLs
-- NEVER construct search/query URLs like "/search?query=..."
-- Prefer the most specific auction page URL (e.g. /auction over /annual-dinner)
+**Step 2: Check the actual event/gala page you found**
+- Once you find an event listing, search for that specific event page to read its full details
+- Look for: "silent auction", "live auction", "paddle raise", "fund-a-need", "mobile bidding"
+- Also look for event platform links: GiveSmart, OneCause, Handbid, BiddingForGood, Eventbrite
 
-## EVIDENCE RULES
-- evidence_date: copy the RAW date text from the page verbatim (e.g. "Saturday, April 10, 2026 | 6:00 PM"). NEVER blank when event_date is filled.
-- evidence_auction: copy the RAW text proving auction exists. NEVER blank when auction_type is filled.
+**Step 3: Find contact info**
+- Search: "{nonprofit} staff" or "{nonprofit} team" or "{nonprofit} contact"
+- Look for Development Director, Event Coordinator, Executive Director
+- NEVER use generic footer emails — only emails from staff/team/contact pages
+- For job title: the org's own site is the MOST TRUSTED source
+
+**Step 4: Find org address + phone**
+- Search: "{nonprofit} address phone" or check Google Maps
+
+## KEY RULES
+- ONLY events from 2026 or later — IGNORE all 2025 or earlier events
+- Galas, benefits, balls, soirees — these VERY OFTEN include silent or live auctions. If a gala page mentions "auction" anywhere, it counts.
+- event_url must be a REAL page — NEVER fabricate URLs
+- evidence_date: copy the RAW date text from the page (e.g. "Saturday, April 10, 2026 | 6:00 PM")
+- evidence_auction: copy the RAW text proving auction exists (e.g. "silent auction and live auction")
+- NEVER leave evidence fields blank when event_date or auction_type is filled
 
 Respond with ONLY valid JSON (no markdown, no extra text):
 {{
@@ -412,7 +425,7 @@ def _claude_call(client: anthropic.Anthropic, prompt: str) -> str:
                 model=CLAUDE_MODEL,
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
-                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
                 temperature=0.2,
             )
             # Extract text from response content blocks
